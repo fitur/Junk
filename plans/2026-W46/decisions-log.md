@@ -4,11 +4,15 @@
 
 ## Läs detta först
 
-- Granskningen gjordes på scriptet som det klistrades in i chatten. Filen finns inte i
-  `fitur/junk`, så platser anges som funktion + kodrad i citat, inte radnummer.
-- PowerShell fanns inte i granskningsmiljön och fick inte installeras. Inget är alltså kört
-  i pwsh och PSScriptAnalyzer är inte körd. Beloppsregexen är testad i Python `re`, som har
-  samma semantik för de konstruktioner som används.
+- Granskningen gjordes först på scriptet som det klistrades in i chatten. Filen ligger nu
+  i repot som `Kvittohantering/Invoke-Kvittohantering.ps1` (commit 193a327). Radnummer i
+  raderna **Rad** gäller den versionen.
+- Uppföljning samma dag med pwsh 7.4.6 och PSScriptAnalyzer 1.23.0: enskilda påståenden
+  testkördes med lokala snuttar, utan nätverk mot kedjorna. Poster som testats har raden
+  **Testkört**. Scriptet självt är inte kört. Testmiljön är Linux i tidszon UTC, så
+  macOS-delarna (rättigheter, nyckelring, Playwright) är inte testade.
+- PSScriptAnalyzer på hela scriptet: inga tolkningsfel, 3 anmärkningar (se E-04).
+  Diffsnuttarna för D-02 och D-03 ger inga anmärkningar.
 - **Underlag** per post: `kod` = följer direkt av koden, `kod+.NET` = följer av koden plus
   dokumenterat .NET/Playwright-beteende som inte kunnat köras här, `antagande` = beror på
   hur kedjan faktiskt svarar.
@@ -20,13 +24,11 @@
 ## Att verifiera innan något annat (V)
 
 ### V-01 Klistringsartefakter i underlaget
-- Status: ingen åtgärd (verifierad mot committad fil: domänerna är vanliga strängar, teckenklassen har blanksteg, punkt, U+00A0 och U+202F) | Allvarlighet: kritisk om de finns i filen, annars ingen
-- Var: `Save-WillysKvitto`/`Save-LidlKvitto` (`-Domain '[www.willys.se](https://www.willys.se)'`),
-  `$script:AmountPos` (teckenklassen `[ .  ]`)
-- Problem: domänen står som markdown-länk och teckenklassen har blanksteg av okänd typ.
-- Åtgärd: kontrollera i den riktiga filen. Domänen ska vara `'www.willys.se'` / `'www.lidl.se'`.
-  Teckenklassen ska vara blanksteg, punkt, U+00A0 och U+202F; skriv dem som `  `
-  så att de överlever kopiering.
+- Status: avklarad, inget fel i filen | Allvarlighet: låg (kvarvarande del)
+- Kontrollerat i repot: rad 596 och 698 har `'www.willys.se'` / `'www.lidl.se'`. Rad 109 har
+  blanksteg, punkt, U+00A0 och U+202F som osynliga literaltecken.
+- Kvarstår: skriv de två osynliga tecknen som `\u00A0\u202F`, så att de syns i diffar och
+  överlever kopiering. Kan göras tillsammans med K-02.
 
 ## Prioritet 1: hög
 
@@ -74,6 +76,7 @@
   `$blockedMonths` är ett `HashSet[string]` som skapas före Willys-blocket, fylls på samma
   sätt i Lidl-`catch`, och kontrolleras i månadsloopen (`if ($blockedMonths.Contains($group.Name)) { varna; continue }`)
   samt före `manad.*`.
+- Rad: 1234.
 - Klart när: körning utan pdftotext lämnar DestinationPath orörd.
 
 ### D-02 Avbruten nedladdning lämnar en halv fil under slutnamnet
@@ -110,6 +113,7 @@
   är markören för "klart", så den ska komma sist.
 - Flagga: `.part`-filer är tillfälliga filer i RawPath. De skrivs över vid nästa försök, men
   de är aldrig färdiga råkvitton. Slutnamn skrivs aldrig över (`Move` utan overwrite).
+- Rad: 647 (Willys), 752 (Lidl).
 - Klart när: Ctrl+C mitt i en nedladdning ger ingen `*.pdf`/`*.json` för det kvittot.
 
 ### D-03 Två kvitton med samma datum, butik och belopp: det andra hämtas aldrig
@@ -132,11 +136,12 @@
 ```
   Följdändring i `ConvertFrom-WillysKvitto`: filnamnsregexen ska sluta på `kr(?:_\d+)?\.pdf$`.
   Samma räknare i `Save-LidlKvitto`.
+- Rad: 639 (Willys), 746 (Lidl). Testkört: räknaren fungerar under StrictMode (`x, x, y, x` ger `x, x_2, y, x_3`).
 - Flagga: filnamnsschemat utökas (bakåtkompatibelt). Stabiliteten förutsätter att båda
   kvittona ligger i samma datumintervall, vilket de gör eftersom datumet ingår i namnet.
 
 ### S-01 Cookie-värde kan skrivas ut i varning
-- Status: föreslagen | Område: säkerhet | Underlag: kod+.NET (ej kört)
+- Status: föreslagen | Område: säkerhet | Underlag: kod, bekräftat i pwsh | Rad: 372
 - Var: `New-CookieSession` (`Write-Warning "Cookie '$name' kunde inte läggas till: $($PSItem.Exception.Message)"`)
 - Problem: `CookieContainer.Add` kastar `CookieException` med texten
   `The 'Value'='<värdet>' part of the cookie is invalid.` när värdet innehåller komma eller
@@ -148,7 +153,8 @@
 +            # Inte Exception.Message: CookieException citerar cookiens värde i klartext
 +            Write-Warning "Cookie '$name' kunde inte läggas till (ogiltigt tecken i värdet)."
 ```
-- Bekräfta först i pwsh: `[System.Net.CookieContainer]::new().Add([System.Net.Cookie]::new('a','x,y','/','example.com'))`.
+- Testkört: `[System.Net.CookieContainer]::new().Add([System.Net.Cookie]::new('a','HEMLIGT,VARDE','/','example.com'))`
+  ger meddelandet `The 'Value'='HEMLIGT,VARDE' part of the cookie is invalid.` Samma för semikolon.
 - Bieffekt att känna till: sådana cookies skickas inte alls. Är det en sessionscookie
   ser det ut som utgången session.
 
@@ -170,6 +176,7 @@
 +            ctx.route("**/*", lambda route: route.abort())
 +            page = ctx.new_page()
 ```
+- Rad: 245.
 - Testa att `set_content` och `bounding_box` fungerar med JS avstängt (Playwright kör sin
   egen kod via CDP, så det ska fungera, men det är inte kört här).
 - Relaterat: `re.search(r"<pre>(.*?)</pre>")` tar bara första `<pre>`. Har Lidl flera block
@@ -202,7 +209,7 @@
   versionen i markörfilen och installera om när den skiljer sig. Hashlåsning: se F-03.
 
 ### K-01 Lidl-datum kan hamna på fel dag och månad
-- Status: föreslagen | Område: korrekthet | Underlag: kod (inkonsekvensen), antagande (Lidls format)
+- Status: föreslagen | Område: korrekthet | Underlag: kod, bekräftat i pwsh (beteendet); antagande (vilket format Lidl skickar) | Rad: 1003
 - Var: `ConvertFrom-LidlKvitto` (`$dt.ToString('yyyy-MM-dd')`) jämfört med `Save-LidlKvitto` (`.ToLocalTime()`)
 - Problem: `ConvertFrom-Json` ger `DateTime` med `Kind=Utc` för strängar som slutar på `Z`.
   Normaliseringen formaterar då UTC-tid, medan filnamnet bygger på lokal tid. Ett köp
@@ -210,9 +217,13 @@
 - Åtgärd: konvertera alltid till svensk tid före formatering, i både nedladdning och
   normalisering: `[System.TimeZoneInfo]::ConvertTime($dto, [System.TimeZoneInfo]::FindSystemTimeZoneById('Europe/Stockholm'))`.
   Det löser också D-05 (filnamn beror på datorns tidszon).
+- Testkört (dator i UTC) med `ConvertFrom-Json`:
+  - `...T22:30:00Z` blir `Kind=Utc` och formateras `2026-04-30 22:30`; i Stockholmstid är det `2026-05-01 00:30`, alltså annan månad.
+  - `...T00:30:00+02:00` blir `Kind=Local` i datorns tidszon, så även datum med offset beror på var scriptet körs.
+  - Utan tidszon blir det `Kind=Unspecified` och lämnas orört.
 
 ### K-02 Beloppsregexen saknar vänstergräns och förstår bara ASCII-minus framför talet
-- Status: föreslagen | Område: korrekthet | Underlag: kod (testat i Python `re`)
+- Status: föreslagen | Område: korrekthet | Underlag: kod, bekräftat i pwsh (.NET-regex) | Rad: 109-110
 - Var: `$script:AmountPos`, `$script:Amount`
 - Testresultat:
   - `123456,78` ger `23456,78` (första siffran tappas)
@@ -224,6 +235,9 @@
   men troligen för ICA (antagande), så gör det samtidigt som N-03.
   Sammanslagningen `100 129,00` går inte att lösa i regexen så länge Willys skriver
   `1 118,34`; kontrollsumman fångar den (se D-04 om att göra kontrollsumman synlig).
+- Testkört: alla fyra resultaten ovan är desamma i .NET. Med `(?<![\d,.])` ger `123456,78`
+  ingen träff alls (i stället för fel belopp), `0493686  19,90` ger `19,90` och `1 118,34`
+  är oförändrat. `[double]::TryParse` klarar inte U+2212, så tecknet måste bytas före tolkning.
 
 ### D-04 Formatändring hos en kedja skriver över bra data med tomma kvitton
 - Status: föreslagen | Område: dataintegritet/korrekthet | Underlag: kod
@@ -249,6 +263,7 @@
 - Var: `Save-WillysKvitto`, sista `catch` (`Write-Warning "Willys $date $($t.storeName): ..."`)
 - Problem: saknas egenskapen kastar StrictMode inne i `catch`, och hela scriptet avbryts.
 - Åtgärd: `$(Get-PropertyValue $t 'storeName')`, som Lidl-funktionen redan gör.
+- Rad: 663. Testkört: `"$($t.storeName)"` på ett objekt utan egenskapen kastar under `Set-StrictMode -Version Latest`.
 
 ### K-04 Nätverksfel i listfasen avbryter hela scriptet före normaliseringen
 - Status: föreslagen | Område: korrekthet | Underlag: kod
@@ -263,6 +278,7 @@
 - Var: `Save-LidlKvitto` (`if ($allOlder -or $seen -ge $total) { break }`)
 - Problem: saknat fält blir 0, och `$seen -ge 0` är alltid sant.
 - Åtgärd: `($total -gt 0 -and $seen -ge $total)`.
+- Rad: 725. Testkört: `[int]($null ?? 0)` ger 0 och `10 -ge 0` är sant.
 
 ### K-06 Bara den ena miljövariabeln satt: den andra kedjan hoppas över tyst
 - Status: föreslagen | Område: korrekthet | Underlag: kod
@@ -277,6 +293,7 @@
 - Åtgärd: hämta med `Invoke-WebRequest`, spara `.Content` oförändrat, tolka en kopia för
   kontrollen. Gäller bara nya nedladdningar.
 - Flagga: samma data som i dag, men byte-exakt. Befintliga filer rörs inte.
+- Rad: 752. Testkört: `"2026-05-01T00:30:00+02:00"` skrivs tillbaka som `"2026-04-30T22:30:00+00:00"` på en dator i UTC.
 
 ## Prioritet 3: låg
 
@@ -296,10 +313,9 @@
 - Åtgärd: prefixa sådana namn med `'` i CSV-raden (inte i JSON).
 
 ### S-04 Verbose kan visa medlemsnummer och kvittoreferens
-- Status: föreslagen | Underlag: antagande (beror på vad `Invoke-WebRequest -Verbose` skriver i 7.4)
-- Var: `Invoke-KvittoRequest` ärver `$VerbosePreference`
-- Åtgärd: kör en gång med `-Verbose` mot en lokal URL och se om URI:n skrivs. I så fall
-  `-Verbose:$false` på webbanropen.
+- Status: föreslagen att avskrivas | Underlag: motbevisat i pwsh 7.4.6
+- Testkört mot lokal server: `Invoke-WebRequest`/`Invoke-RestMethod -Verbose` skriver
+  `Requested HTTP/1.1 GET with 0-byte payload` utan URI. Ingen åtgärd behövs.
 
 ### S-05 Cookie-strängar lever kvar i `$auto` och sessionsobjekten
 - Status: föreslagen | Underlag: kod
@@ -365,7 +381,15 @@
 - `Get-SafeName`: `åäöÅÄÖ` är redan med i `\w`.
 - Blocken för daterade och odaterade kvitton i steg 2 gör samma sak: en lokal funktion.
 - `Write-CsvFile -Header` används bara för tom fil; behåll, men ta rubrikerna från första raden när rader finns (görs redan) och dokumentera det.
-- Kör PSScriptAnalyzer efter varje ändring; den är inte körd i granskningen.
+- Kör PSScriptAnalyzer efter varje ändring.
+
+### E-04 PSScriptAnalyzer-anmärkningar i nuvarande version
+- Status: föreslagen | Underlag: kört (PSScriptAnalyzer 1.23.0, standardregler)
+- `PSUseBOMForUnicodeEncodedFile` (varning): filen har åäö men ingen BOM. pwsh 7 läser
+  UTF-8 utan BOM, så det är ofarligt med `#Requires -Version 7.4`. Välj: lägg till BOM
+  eller undanta regeln i en `PSScriptAnalyzerSettings.psd1`.
+- `PSUseOutputTypeCorrectly` (information, rad 294-295): `ConvertTo-Array` saknar
+  `[OutputType([object[]])]`.
 
 ## Nya kedjor: Hemköp och ICA (N)
 
