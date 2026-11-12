@@ -322,7 +322,7 @@
 - Åtgärd: fråga per kedja som saknar värde. Görs enklast i kedjetabellen (N-01).
 
 ### D-06 Lidls "råkvitto" är omserialiserat
-- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Status: genomförd i 1.6.0 (testad lokalt: byte-exakt i UTC och America/New_York, inloggningssida ger UnauthorizedAccessException utan rester). Genomförd med -OutFile direkt till .part i stället för .Content, så att även BOM och radbrytningar bevaras | Område: dataintegritet | Underlag: kod
 - Var: `Save-LidlKvitto` (`ConvertTo-Json -InputObject $detail -Depth 20`)
 - Problem: svaret tolkas och skrivs ut igen. Datumsträngar blir `DateTime` och skrivs i
   annat format, och djup över 20 kapas. Filen är inte det kedjan skickade.
