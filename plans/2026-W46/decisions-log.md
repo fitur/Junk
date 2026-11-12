@@ -77,7 +77,7 @@
 - Klart när: körning utan pdftotext lämnar DestinationPath orörd.
 
 ### D-02 Avbruten nedladdning lämnar en halv fil under slutnamnet
-- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Status: genomförd i 1.1.0 (testad lokalt med stubbad Invoke-KvittoRequest) | Område: dataintegritet | Underlag: kod
 - Var: `Save-WillysKvitto` (`Invoke-KvittoRequest ... -OutFile $fileName`), `Save-LidlKvitto`
   (`WriteAllText($jsonFile ...)`)
 - Problem: PDF:en strömmas direkt till slutnamnet. Bryts körningen eller anslutningen
@@ -113,7 +113,7 @@
 - Klart när: Ctrl+C mitt i en nedladdning ger ingen `*.pdf`/`*.json` för det kvittot.
 
 ### D-03 Två kvitton med samma datum, butik och belopp: det andra hämtas aldrig
-- Status: föreslagen | Område: dataintegritet | Underlag: kod (hur ofta det händer: antagande)
+- Status: genomförd i 1.1.0 (testad lokalt med stubbad Invoke-KvittoRequest) | Område: dataintegritet | Underlag: kod (hur ofta det händer: antagande)
 - Var: `Save-WillysKvitto` och `Save-LidlKvitto` (`if (Test-Path -LiteralPath ...) { $result.Fanns++; continue }`)
 - Problem: filnamnet är enda identiteten. Två köp samma dag i samma butik på samma summa
   ger samma namn, det andra räknas som "fanns redan" och försvinner tyst.
@@ -136,7 +136,7 @@
   kvittona ligger i samma datumintervall, vilket de gör eftersom datumet ingår i namnet.
 
 ### S-01 Cookie-värde kan skrivas ut i varning
-- Status: föreslagen | Område: säkerhet | Underlag: kod+.NET (ej kört)
+- Status: genomförd i 1.1.0 (testad lokalt med stubbad Invoke-KvittoRequest) | Område: säkerhet | Underlag: kod+.NET (ej kört)
 - Var: `New-CookieSession` (`Write-Warning "Cookie '$name' kunde inte läggas till: $($PSItem.Exception.Message)"`)
 - Problem: `CookieContainer.Add` kastar `CookieException` med texten
   `The 'Value'='<värdet>' part of the cookie is invalid.` när värdet innehåller komma eller
