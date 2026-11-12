@@ -49,8 +49,11 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.2.0
+    Version:   1.3.0
     Changelog:
+        1.3.0 - S-02: cookies i miljövariabler ärvs inte av barnprocesser. S-03: AppDir med rättigheter 700.
+                L-01: Playwright låst till 1.65.1, version i markörfilen. U-01: Lidl-HTML renderas utan
+                script och nätverk.
         1.2.0 - K-01: alla datum/tider i svensk tid (Europe/Stockholm). K-02: vänstergräns i beloppsregexen och
                 U+2212 som minus. K-03: StrictMode-säker felhantering i Willys. K-04: omförsök vid nätverksfel,
                 tak 60 s på väntan, fel per kedja stoppar inte normaliseringen. K-05: Lidl-paginering utan
@@ -67,6 +70,11 @@
     Cookies innehåller inloggningstoken - de läses dolt och sparas aldrig på disk av skriptet.
     Med -AutoCookie sparar webbläsarprofilen i AppDir inloggningen, precis som en vanlig webbläsare.
     Avinstallera -AutoCookie genom att radera ~/Library/Application Support/Kvittohantering.
+    Mappen får rättigheterna 700. Profilen innehåller inloggningscookies som i praktiken inte är
+    krypterade (Playwright använder mock-nyckelring), och mappen följer med i Time Machine-backuper.
+    Playwright är låst till en version ($script:PlaywrightVersion); en ändring ominstallerar webbläsaren.
+    WILLYS_COOKIE / LIDL_COOKIE tas bort ur processmiljön under körningen och återställs efteråt,
+    så att barnprocesser (pip, Chromium, pdftotext) inte ärver dem.
 #>
 
 #Requires -Version 7.4
@@ -139,6 +147,13 @@ $script:UserAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit
 # Allt för -AutoCookie (venv, webbläsare, profil) samlas här - utanför Dokument,
 # som ofta synkas till iCloud. Radera mappen för att avinstallera.
 $script:AppDir = Join-Path -Path $HOME -ChildPath 'Library/Application Support/Kvittohantering'
+
+# Låst Playwright-version: paketet och webbläsarbygget hör ihop. Höj här medvetet; markörfilen
+# innehåller versionen, så en ändring ger en ominstallation vid nästa körning.
+$script:PlaywrightVersion = '1.65.1'
+
+# AppDir innehåller webbläsarprofilen (cookies, i praktiken okrypterade): bara ägaren (700)
+$script:AppDirMode = [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute'
 
 # Python-hjälpare (Playwright) med två kommandon:
 #   cookies - inloggning via webbläsarfönster (-AutoCookie)
@@ -261,7 +276,10 @@ def cmd_pdf(a):
         # channel="chromium" = fullversionen i headless-läge (headless shell installeras inte)
         browser = p.chromium.launch(channel="chromium", headless=True)
         try:
-            page = browser.new_page()
+            # Kvitto-HTML är opålitlig data: inga script och inget nätverk vid rendering
+            ctx = browser.new_context(java_script_enabled=False, offline=True)
+            ctx.route("**/*", lambda route: route.abort())
+            page = ctx.new_page()
             for job in jobs:
                 try:
                     render_receipt(page, job)
@@ -501,7 +519,8 @@ function Initialize-Kvittowebblasare {
 
     $python = Join-Path $script:AppDir 'venv/bin/python'
     $marker = Join-Path $script:AppDir "browsers/.installerad-$Browser"
-    if ((Test-Path -LiteralPath $python) -and (Test-Path -LiteralPath $marker)) { return $python }
+    if ((Test-Path -LiteralPath $python) -and (Test-Path -LiteralPath $marker) -and
+        ([System.IO.File]::ReadAllText($marker).Trim() -eq $script:PlaywrightVersion)) { return $python }
 
     $sysPython = Get-Command -Name 'python3' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $sysPython) { throw 'python3 saknas. Installera Xcode Command Line Tools: xcode-select --install' }
@@ -509,7 +528,8 @@ function Initialize-Kvittowebblasare {
     if (-not $PSCmdlet.ShouldProcess($script:AppDir, "Installera Playwright och $Browser (engångsåtgärd, ca 150-250 MB)")) {
         throw 'Installationen av webbläsaren avbröts.'
     }
-    [void][System.IO.Directory]::CreateDirectory($script:AppDir)
+    # S-03: bara ägaren når mappen (profilen med inloggning ligger här)
+    [void][System.IO.Directory]::CreateDirectory($script:AppDir, $script:AppDirMode)
 
     if (-not (Test-Path -LiteralPath $python)) {
         Write-Information 'Skapar Python-miljö...' -InformationAction Continue
@@ -517,7 +537,7 @@ function Initialize-Kvittowebblasare {
         if ($LASTEXITCODE -ne 0) { throw "python3 -m venv misslyckades (kod $LASTEXITCODE)" }
     }
     Write-Information 'Installerar Playwright...' -InformationAction Continue
-    & $python -m pip install --quiet --disable-pip-version-check --upgrade playwright | Out-Host
+    & $python -m pip install --quiet --disable-pip-version-check "playwright==$($script:PlaywrightVersion)" | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "pip install playwright misslyckades (kod $LASTEXITCODE)" }
 
     Write-Information "Laddar ner $Browser..." -InformationAction Continue
@@ -526,7 +546,7 @@ function Initialize-Kvittowebblasare {
     & $python @installArgs | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "playwright install $Browser misslyckades (kod $LASTEXITCODE)" }
 
-    [System.IO.File]::WriteAllText($marker, (Get-Date).ToString('o'), $script:Utf8NoBom)
+    [System.IO.File]::WriteAllText($marker, $script:PlaywrightVersion, $script:Utf8NoBom)
     return $python
 }
 
@@ -546,6 +566,8 @@ function Invoke-Kvittohjalpare {
         # Webbläsarna läggs i AppDir i stället för ~/Library/Caches/ms-playwright
         $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $script:AppDir 'browsers'
         $python = Initialize-Kvittowebblasare -Browser $Browser
+        # Gäller även en mapp som skapats tidigare med standardrättigheter
+        [System.IO.File]::SetUnixFileMode($script:AppDir, $script:AppDirMode)
 
         $helper = Join-Path $script:AppDir 'kvittohjalpare.py'
         [System.IO.File]::WriteAllText($helper, $script:HelperPy, $script:Utf8NoBom)
@@ -1206,254 +1228,269 @@ $DestinationPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPath
 
 if ($FromDate -gt $ToDate) { throw "FromDate ($($FromDate.ToString('yyyy-MM-dd'))) ligger efter ToDate ($($ToDate.ToString('yyyy-MM-dd')))." }
 
-# --------------------------------------------------------------------------
-# Steg 1: Nedladdning
-# --------------------------------------------------------------------------
-if (-not $SkipDownload) {
-    # Cookies hålls bara i minnet. Källa i prioritetsordning:
-    # -AutoCookie (webbläsarfönster) > miljövariabler > dold inmatning
-    $willysCookie = $null
-    $lidlCookie   = $null
-    if ($AutoCookie) {
-        if ($PSCmdlet.ShouldProcess('webbläsarfönster', "Hämta inloggning för $($Chain -join ' och ')")) {
-            $auto = Get-KvittoCookieAutomatisk -Chain $Chain -Browser $Browser
-            $willysCookie = Get-PropertyValue $auto 'willys'
-            $lidlCookie   = Get-PropertyValue $auto 'lidl'
-        }
-    }
-    else {
-        $willysCookie = $env:WILLYS_COOKIE
-        $lidlCookie   = $env:LIDL_COOKIE
-        # Fråga per kedja som saknar värde (utan inmatning, t.ex. schemalagt, varnar vi i stället)
-        $saknas = @(
-            if ('Willys' -in $Chain -and [string]::IsNullOrWhiteSpace($willysCookie)) { 'Willys' }
-            if ('Lidl' -in $Chain -and [string]::IsNullOrWhiteSpace($lidlCookie)) { 'Lidl' }
-        )
-        if ($saknas.Count -gt 0 -and [Console]::IsInputRedirected) {
-            Write-Warning "Cookie saknas för $($saknas -join ' och ') (WILLYS_COOKIE / LIDL_COOKIE) - kedjan hoppas över."
-        }
-        elseif ($saknas.Count -gt 0) {
-            Write-Information 'Klistra in Cookie-raden från webbläsarens nätverksflik. Tomt = hoppa över kedjan.' -InformationAction Continue
-            if ('Willys' -in $saknas) { $willysCookie = Read-Host -Prompt 'Willys-cookie (från willys.se/mina-kop)' -MaskInput }
-            if ('Lidl' -in $saknas)   { $lidlCookie   = Read-Host -Prompt 'Lidl-cookie (från ett mre/api-anrop, hämta precis innan)' -MaskInput }
-        }
-    }
-    if ('Willys' -notin $Chain) { $willysCookie = $null }
-    if ('Lidl' -notin $Chain)   { $lidlCookie   = $null }
-
-    $downloads = [System.Collections.Generic.List[object]]::new()
-
-    # Lidl först - dess token lever bara ca 30 minuter
-    if (-not [string]::IsNullOrWhiteSpace($lidlCookie)) {
-        Write-Information 'Hämtar Lidl-kvitton...' -InformationAction Continue
-        try {
-            $downloads.Add((Save-LidlKvitto -CookieString $lidlCookie -OutputDir (Join-Path $RawPath 'lidl') -From $FromDate -To $ToDate))
-        }
-        catch [System.UnauthorizedAccessException] {
-            Write-Warning "Lidl avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
-        }
-        catch {
-            Write-Warning "Lidl avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($willysCookie)) {
-        Write-Information 'Hämtar Willys-kvitton...' -InformationAction Continue
-        try {
-            $downloads.Add((Save-WillysKvitto -CookieString $willysCookie -OutputDir (Join-Path $RawPath 'willys') -From $FromDate -To $ToDate))
-        }
-        catch [System.UnauthorizedAccessException] {
-            Write-Warning "Willys avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
-        }
-        catch {
-            Write-Warning "Willys avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
-        }
-    }
-
-    # Släpp cookies ur minnet så snart de inte behövs
-    $willysCookie = $null
-    $lidlCookie   = $null
-
-    foreach ($d in $downloads) {
-        Write-Information ('{0}: {1} i perioden, {2} nya, {3} fanns redan, {4} misslyckade' -f
-            $d.Kedja, $d.Hittade, $d.Nya, $d.Fanns, $d.Misslyckade) -InformationAction Continue
-    }
+# S-02: cookies i miljövariabler hämtas till variabler och tas bort ur processmiljön, så att
+# barnprocesser (pip, Playwright, Chromium, pdftotext) inte ärver dem. Återställs i finally.
+$envCookies = @{}
+foreach ($envName in 'WILLYS_COOKIE', 'LIDL_COOKIE') {
+    $envCookies[$envName] = [System.Environment]::GetEnvironmentVariable($envName)
+    [System.Environment]::SetEnvironmentVariable($envName, $null)
 }
 
-# --------------------------------------------------------------------------
-# Steg 1b: PDF av Lidl-kvitton (för Paperless) - även för tidigare nedladdade
-# --------------------------------------------------------------------------
-$lidlRawDir = Join-Path $RawPath 'lidl'
-if (-not $SkipPdf -and (Test-Path -LiteralPath $lidlRawDir -PathType Container)) {
-    try {
-        $created = ConvertTo-LidlPdf -LidlDir $lidlRawDir
-        if ($created -gt 0) { Write-Information "Skapade $created Lidl-PDF:er." -InformationAction Continue }
-    }
-    catch {
-        Write-Warning "Lidl-PDF:er kunde inte skapas: $($PSItem.Exception.Message) Normaliseringen fortsätter."
-    }
-}
-
-# --------------------------------------------------------------------------
-# Steg 2: Normalisering av ALLA råkvitton
-# --------------------------------------------------------------------------
-if (-not (Test-Path -LiteralPath $RawPath -PathType Container)) {
-    Write-Warning "Råkvittomappen finns inte: $RawPath"
-    return
-}
-
-$receipts = [System.Collections.Generic.List[object]]::new()
-
-# Månader (yyyy-MM, eller 'Odaterade') där minst ett råkvitto inte gick att tolka. Allt skrivs om
-# från noll, så en månad med ofullständigt underlag får inte skrivas: en tidigare bra fil ska stå kvar.
-$blockedMonths = [System.Collections.Generic.HashSet[string]]::new()
-$failedFiles   = [System.Collections.Generic.List[string]]::new()
-
-function Block-KvittoManad {
-    # Spärrar månaden (ur filnamnets datumprefix) för skrivning och minns filen till varningen.
-    param([Parameter(Mandatory)][string]$FileName)
-
-    $month = if ($FileName -match '^(\d{4}-\d{2})') { $Matches[1] } else { 'Odaterade' }
-    [void]$blockedMonths.Add($month)
-    $failedFiles.Add($FileName)
-}
-
-# Willys
-$willysDir = Join-Path $RawPath 'willys'
-$pdfFiles  = @(if (Test-Path -LiteralPath $willysDir) {
-        Get-ChildItem -LiteralPath $willysDir -Filter '*.pdf' -File | Sort-Object -Property Name
-    })
-if ($pdfFiles.Count -gt 0) {
-    $pdfToText = Find-PdfToText -Hint $PdfToTextPath
-    if (-not $pdfToText) {
-        # Avbryt före skrivning: annars skrivs alla månadsfiler om utan Willys-kvitton
-        throw "pdftotext saknas - $($pdfFiles.Count) Willys-kvitton kan inte tolkas. Installera med: brew install poppler"
-    }
-    Write-Verbose "Använder pdftotext: $pdfToText"
-    foreach ($pdf in $pdfFiles) {
-        try {
-            $receipts.Add((ConvertFrom-WillysKvitto -File $pdf -PdfToText $pdfToText))
-        }
-        catch {
-            Block-KvittoManad -FileName $pdf.Name
-            Write-Warning "Willys $($pdf.Name): $($PSItem.Exception.Message)"
-        }
-    }
-}
-
-# Lidl
-$lidlDir   = Join-Path $RawPath 'lidl'
-$jsonFiles = @(if (Test-Path -LiteralPath $lidlDir) {
-        Get-ChildItem -LiteralPath $lidlDir -Filter '*.json' -File |
-            Where-Object { $_.Name -ne 'kvittolista.json' } |
-            Sort-Object -Property Name
-    })
-foreach ($js in $jsonFiles) {
-    try {
-        $receipts.Add((ConvertFrom-LidlKvitto -File $js))
-    }
-    catch {
-        Block-KvittoManad -FileName $js.Name
-        Write-Warning "Lidl $($js.Name): $($PSItem.Exception.Message)"
-    }
-}
-
-if ($failedFiles.Count -gt 0) {
-    Write-Warning ("{0} råkvitton gick inte att tolka. Berörda månader ({1}) skrivs inte och manad.json/manad.csv uppdateras inte. Filer: {2}" -f
-        $failedFiles.Count, (($blockedMonths | Sort-Object) -join ', '), ($failedFiles -join ', '))
-}
-
-if ($receipts.Count -eq 0) {
-    Write-Warning "Inga kvitton att normalisera i $RawPath"
-    return
-}
-Write-Information "Normaliserar $($receipts.Count) kvitton..." -InformationAction Continue
-
-# Kontrollsumma per kvitto: rader + rabatter mot total
-foreach ($r in $receipts) {
-    $radsum = 0.0
-    foreach ($it in $r.items) { $radsum += ($it.line_total ?? 0) + ($it.discount ?? 0) }
-    $diff = [math]::Round($radsum - ($r.total ?? 0), 2)
-    if ([math]::Abs($diff) -ge 0.01) {
-        Write-Warning ('DIFF {0} kr: {1} {2} {3} ({4}) - kontrollera mot originalet' -f
-            (Format-Krona $diff), $r.date, $r.chain, $r.store, $r.source_file)
-    }
-}
-
-# Skriv per år/månad
-$dated   = @($receipts | Where-Object { $_.date } | Sort-Object -Property date -Descending)
-$undated = @($receipts | Where-Object { -not $_.date })
-
-foreach ($group in ($dated | Group-Object -Property { $_.date.Substring(0, 7) } | Sort-Object -Property Name)) {
-    $year   = $group.Name.Substring(0, 4)
-    $mnum   = [int]$group.Name.Substring(5, 2)
-    $mname  = '{0:D2}-{1}' -f $mnum, $script:Manader[$mnum]
-    $folder = Join-Path (Join-Path $DestinationPath $year) $mname
-
-    if ($blockedMonths.Contains($group.Name)) {
-        Write-Warning "Hoppar över ${year}/${mname}: minst ett råkvitto för månaden gick inte att tolka. Befintliga filer lämnas orörda."
-        continue
-    }
-
-    if ($PSCmdlet.ShouldProcess($folder, "Skriv $($group.Count) normaliserade kvitton")) {
-        Export-KvittoMapp -Folder $folder -Receipts @($group.Group) -Source $RawPath
-        [pscustomobject]@{ Manad = "$year/$mname"; Kvitton = $group.Count; Mapp = $folder }
-    }
-}
-
-if ($undated.Count -gt 0 -and $blockedMonths.Contains('Odaterade')) {
-    Write-Warning "Hoppar över Odaterade: ett råkvitto utan läsbart datum i filnamnet gick inte att tolka. Befintliga filer lämnas orörda."
-}
-elseif ($undated.Count -gt 0) {
-    $folder = Join-Path $DestinationPath 'Odaterade'
-    Write-Warning "$($undated.Count) kvitton saknar tolkbart datum och läggs i $folder"
-    if ($PSCmdlet.ShouldProcess($folder, "Skriv $($undated.Count) odaterade kvitton")) {
-        Export-KvittoMapp -Folder $folder -Receipts $undated -Source $RawPath
-        [pscustomobject]@{ Manad = 'Odaterade'; Kvitton = $undated.Count; Mapp = $folder }
-    }
-}
-
-# Översikt per månad och kedja
-$overview = @($dated |
-        Group-Object -Property { '{0}|{1}' -f $_.date.Substring(0, 7), $_.chain } |
-        ForEach-Object {
-            $first = $_.Group[0]
-            $sumTotal = 0.0; $sumSaved = 0.0; $nItems = 0
-            foreach ($r in $_.Group) {
-                $sumTotal += $r.total ?? 0
-                $sumSaved += $r.savings ?? 0
-                $nItems   += @($r.items).Count
+try {
+    # --------------------------------------------------------------------------
+    # Steg 1: Nedladdning
+    # --------------------------------------------------------------------------
+    if (-not $SkipDownload) {
+        # Cookies hålls bara i minnet. Källa i prioritetsordning:
+        # -AutoCookie (webbläsarfönster) > miljövariabler > dold inmatning
+        $willysCookie = $null
+        $lidlCookie   = $null
+        if ($AutoCookie) {
+            if ($PSCmdlet.ShouldProcess('webbläsarfönster', "Hämta inloggning för $($Chain -join ' och ')")) {
+                $auto = Get-KvittoCookieAutomatisk -Chain $Chain -Browser $Browser
+                $willysCookie = Get-PropertyValue $auto 'willys'
+                $lidlCookie   = Get-PropertyValue $auto 'lidl'
             }
+        }
+        else {
+            $willysCookie = $envCookies['WILLYS_COOKIE']
+            $lidlCookie   = $envCookies['LIDL_COOKIE']
+            # Fråga per kedja som saknar värde (utan inmatning, t.ex. schemalagt, varnar vi i stället)
+            $saknas = @(
+                if ('Willys' -in $Chain -and [string]::IsNullOrWhiteSpace($willysCookie)) { 'Willys' }
+                if ('Lidl' -in $Chain -and [string]::IsNullOrWhiteSpace($lidlCookie)) { 'Lidl' }
+            )
+            if ($saknas.Count -gt 0 -and [Console]::IsInputRedirected) {
+                Write-Warning "Cookie saknas för $($saknas -join ' och ') (WILLYS_COOKIE / LIDL_COOKIE) - kedjan hoppas över."
+            }
+            elseif ($saknas.Count -gt 0) {
+                Write-Information 'Klistra in Cookie-raden från webbläsarens nätverksflik. Tomt = hoppa över kedjan.' -InformationAction Continue
+                if ('Willys' -in $saknas) { $willysCookie = Read-Host -Prompt 'Willys-cookie (från willys.se/mina-kop)' -MaskInput }
+                if ('Lidl' -in $saknas)   { $lidlCookie   = Read-Host -Prompt 'Lidl-cookie (från ett mre/api-anrop, hämta precis innan)' -MaskInput }
+            }
+        }
+        if ('Willys' -notin $Chain) { $willysCookie = $null }
+        if ('Lidl' -notin $Chain)   { $lidlCookie   = $null }
+
+        $downloads = [System.Collections.Generic.List[object]]::new()
+
+        # Lidl först - dess token lever bara ca 30 minuter
+        if (-not [string]::IsNullOrWhiteSpace($lidlCookie)) {
+            Write-Information 'Hämtar Lidl-kvitton...' -InformationAction Continue
+            try {
+                $downloads.Add((Save-LidlKvitto -CookieString $lidlCookie -OutputDir (Join-Path $RawPath 'lidl') -From $FromDate -To $ToDate))
+            }
+            catch [System.UnauthorizedAccessException] {
+                Write-Warning "Lidl avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
+            }
+            catch {
+                Write-Warning "Lidl avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($willysCookie)) {
+            Write-Information 'Hämtar Willys-kvitton...' -InformationAction Continue
+            try {
+                $downloads.Add((Save-WillysKvitto -CookieString $willysCookie -OutputDir (Join-Path $RawPath 'willys') -From $FromDate -To $ToDate))
+            }
+            catch [System.UnauthorizedAccessException] {
+                Write-Warning "Willys avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
+            }
+            catch {
+                Write-Warning "Willys avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
+            }
+        }
+
+        # Släpp cookies ur minnet så snart de inte behövs
+        $willysCookie = $null
+        $lidlCookie   = $null
+
+        foreach ($d in $downloads) {
+            Write-Information ('{0}: {1} i perioden, {2} nya, {3} fanns redan, {4} misslyckade' -f
+                $d.Kedja, $d.Hittade, $d.Nya, $d.Fanns, $d.Misslyckade) -InformationAction Continue
+        }
+    }
+
+    # --------------------------------------------------------------------------
+    # Steg 1b: PDF av Lidl-kvitton (för Paperless) - även för tidigare nedladdade
+    # --------------------------------------------------------------------------
+    $lidlRawDir = Join-Path $RawPath 'lidl'
+    if (-not $SkipPdf -and (Test-Path -LiteralPath $lidlRawDir -PathType Container)) {
+        try {
+            $created = ConvertTo-LidlPdf -LidlDir $lidlRawDir
+            if ($created -gt 0) { Write-Information "Skapade $created Lidl-PDF:er." -InformationAction Continue }
+        }
+        catch {
+            Write-Warning "Lidl-PDF:er kunde inte skapas: $($PSItem.Exception.Message) Normaliseringen fortsätter."
+        }
+    }
+
+    # --------------------------------------------------------------------------
+    # Steg 2: Normalisering av ALLA råkvitton
+    # --------------------------------------------------------------------------
+    if (-not (Test-Path -LiteralPath $RawPath -PathType Container)) {
+        Write-Warning "Råkvittomappen finns inte: $RawPath"
+        return
+    }
+
+    $receipts = [System.Collections.Generic.List[object]]::new()
+
+    # Månader (yyyy-MM, eller 'Odaterade') där minst ett råkvitto inte gick att tolka. Allt skrivs om
+    # från noll, så en månad med ofullständigt underlag får inte skrivas: en tidigare bra fil ska stå kvar.
+    $blockedMonths = [System.Collections.Generic.HashSet[string]]::new()
+    $failedFiles   = [System.Collections.Generic.List[string]]::new()
+
+    function Block-KvittoManad {
+        # Spärrar månaden (ur filnamnets datumprefix) för skrivning och minns filen till varningen.
+        param([Parameter(Mandatory)][string]$FileName)
+
+        $month = if ($FileName -match '^(\d{4}-\d{2})') { $Matches[1] } else { 'Odaterade' }
+        [void]$blockedMonths.Add($month)
+        $failedFiles.Add($FileName)
+    }
+
+    # Willys
+    $willysDir = Join-Path $RawPath 'willys'
+    $pdfFiles  = @(if (Test-Path -LiteralPath $willysDir) {
+            Get-ChildItem -LiteralPath $willysDir -Filter '*.pdf' -File | Sort-Object -Property Name
+        })
+    if ($pdfFiles.Count -gt 0) {
+        $pdfToText = Find-PdfToText -Hint $PdfToTextPath
+        if (-not $pdfToText) {
+            # Avbryt före skrivning: annars skrivs alla månadsfiler om utan Willys-kvitton
+            throw "pdftotext saknas - $($pdfFiles.Count) Willys-kvitton kan inte tolkas. Installera med: brew install poppler"
+        }
+        Write-Verbose "Använder pdftotext: $pdfToText"
+        foreach ($pdf in $pdfFiles) {
+            try {
+                $receipts.Add((ConvertFrom-WillysKvitto -File $pdf -PdfToText $pdfToText))
+            }
+            catch {
+                Block-KvittoManad -FileName $pdf.Name
+                Write-Warning "Willys $($pdf.Name): $($PSItem.Exception.Message)"
+            }
+        }
+    }
+
+    # Lidl
+    $lidlDir   = Join-Path $RawPath 'lidl'
+    $jsonFiles = @(if (Test-Path -LiteralPath $lidlDir) {
+            Get-ChildItem -LiteralPath $lidlDir -Filter '*.json' -File |
+                Where-Object { $_.Name -ne 'kvittolista.json' } |
+                Sort-Object -Property Name
+        })
+    foreach ($js in $jsonFiles) {
+        try {
+            $receipts.Add((ConvertFrom-LidlKvitto -File $js))
+        }
+        catch {
+            Block-KvittoManad -FileName $js.Name
+            Write-Warning "Lidl $($js.Name): $($PSItem.Exception.Message)"
+        }
+    }
+
+    if ($failedFiles.Count -gt 0) {
+        Write-Warning ("{0} råkvitton gick inte att tolka. Berörda månader ({1}) skrivs inte och manad.json/manad.csv uppdateras inte. Filer: {2}" -f
+            $failedFiles.Count, (($blockedMonths | Sort-Object) -join ', '), ($failedFiles -join ', '))
+    }
+
+    if ($receipts.Count -eq 0) {
+        Write-Warning "Inga kvitton att normalisera i $RawPath"
+        return
+    }
+    Write-Information "Normaliserar $($receipts.Count) kvitton..." -InformationAction Continue
+
+    # Kontrollsumma per kvitto: rader + rabatter mot total
+    foreach ($r in $receipts) {
+        $radsum = 0.0
+        foreach ($it in $r.items) { $radsum += ($it.line_total ?? 0) + ($it.discount ?? 0) }
+        $diff = [math]::Round($radsum - ($r.total ?? 0), 2)
+        if ([math]::Abs($diff) -ge 0.01) {
+            Write-Warning ('DIFF {0} kr: {1} {2} {3} ({4}) - kontrollera mot originalet' -f
+                (Format-Krona $diff), $r.date, $r.chain, $r.store, $r.source_file)
+        }
+    }
+
+    # Skriv per år/månad
+    $dated   = @($receipts | Where-Object { $_.date } | Sort-Object -Property date -Descending)
+    $undated = @($receipts | Where-Object { -not $_.date })
+
+    foreach ($group in ($dated | Group-Object -Property { $_.date.Substring(0, 7) } | Sort-Object -Property Name)) {
+        $year   = $group.Name.Substring(0, 4)
+        $mnum   = [int]$group.Name.Substring(5, 2)
+        $mname  = '{0:D2}-{1}' -f $mnum, $script:Manader[$mnum]
+        $folder = Join-Path (Join-Path $DestinationPath $year) $mname
+
+        if ($blockedMonths.Contains($group.Name)) {
+            Write-Warning "Hoppar över ${year}/${mname}: minst ett råkvitto för månaden gick inte att tolka. Befintliga filer lämnas orörda."
+            continue
+        }
+
+        if ($PSCmdlet.ShouldProcess($folder, "Skriv $($group.Count) normaliserade kvitton")) {
+            Export-KvittoMapp -Folder $folder -Receipts @($group.Group) -Source $RawPath
+            [pscustomobject]@{ Manad = "$year/$mname"; Kvitton = $group.Count; Mapp = $folder }
+        }
+    }
+
+    if ($undated.Count -gt 0 -and $blockedMonths.Contains('Odaterade')) {
+        Write-Warning "Hoppar över Odaterade: ett råkvitto utan läsbart datum i filnamnet gick inte att tolka. Befintliga filer lämnas orörda."
+    }
+    elseif ($undated.Count -gt 0) {
+        $folder = Join-Path $DestinationPath 'Odaterade'
+        Write-Warning "$($undated.Count) kvitton saknar tolkbart datum och läggs i $folder"
+        if ($PSCmdlet.ShouldProcess($folder, "Skriv $($undated.Count) odaterade kvitton")) {
+            Export-KvittoMapp -Folder $folder -Receipts $undated -Source $RawPath
+            [pscustomobject]@{ Manad = 'Odaterade'; Kvitton = $undated.Count; Mapp = $folder }
+        }
+    }
+
+    # Översikt per månad och kedja
+    $overview = @($dated |
+            Group-Object -Property { '{0}|{1}' -f $_.date.Substring(0, 7), $_.chain } |
+            ForEach-Object {
+                $first = $_.Group[0]
+                $sumTotal = 0.0; $sumSaved = 0.0; $nItems = 0
+                foreach ($r in $_.Group) {
+                    $sumTotal += $r.total ?? 0
+                    $sumSaved += $r.savings ?? 0
+                    $nItems   += @($r.items).Count
+                }
+                [pscustomobject]@{
+                    manad         = $first.date.Substring(0, 7)
+                    kedja         = $first.chain
+                    antal_kvitton = $_.Count
+                    summa_total   = [math]::Round($sumTotal, 2)
+                    summa_sparat  = [math]::Round($sumSaved, 2)
+                    antal_varor   = $nItems
+                }
+            } |
+            Sort-Object -Property manad, kedja -Descending)
+
+    if ($blockedMonths.Count -gt 0) {
+        # Översikten räknas på alla kvitton; med ofullständigt underlag skulle den bli fel
+        Write-Warning 'Hoppar över manad.json och manad.csv: underlaget är ofullständigt (se varning ovan).'
+    }
+    elseif ($PSCmdlet.ShouldProcess($DestinationPath, 'Skriv månadsöversikt (manad.json + manad.csv)')) {
+        [void][System.IO.Directory]::CreateDirectory($DestinationPath)
+        [System.IO.File]::WriteAllText((Join-Path $DestinationPath 'manad.json'),
+            (ConvertTo-Json -InputObject $overview -Depth 20), $script:Utf8NoBom)
+
+        $csvRows = foreach ($o in $overview) {
             [pscustomobject]@{
-                manad         = $first.date.Substring(0, 7)
-                kedja         = $first.chain
-                antal_kvitton = $_.Count
-                summa_total   = [math]::Round($sumTotal, 2)
-                summa_sparat  = [math]::Round($sumSaved, 2)
-                antal_varor   = $nItems
+                manad         = $o.manad
+                kedja         = $o.kedja
+                antal_kvitton = $o.antal_kvitton
+                summa_total   = Format-Krona $o.summa_total
+                summa_sparat  = Format-Krona $o.summa_sparat
+                antal_varor   = $o.antal_varor
             }
-        } |
-        Sort-Object -Property manad, kedja -Descending)
-
-if ($blockedMonths.Count -gt 0) {
-    # Översikten räknas på alla kvitton; med ofullständigt underlag skulle den bli fel
-    Write-Warning 'Hoppar över manad.json och manad.csv: underlaget är ofullständigt (se varning ovan).'
-}
-elseif ($PSCmdlet.ShouldProcess($DestinationPath, 'Skriv månadsöversikt (manad.json + manad.csv)')) {
-    [void][System.IO.Directory]::CreateDirectory($DestinationPath)
-    [System.IO.File]::WriteAllText((Join-Path $DestinationPath 'manad.json'),
-        (ConvertTo-Json -InputObject $overview -Depth 20), $script:Utf8NoBom)
-
-    $csvRows = foreach ($o in $overview) {
-        [pscustomobject]@{
-            manad         = $o.manad
-            kedja         = $o.kedja
-            antal_kvitton = $o.antal_kvitton
-            summa_total   = Format-Krona $o.summa_total
-            summa_sparat  = Format-Krona $o.summa_sparat
-            antal_varor   = $o.antal_varor
         }
+        Write-CsvFile -Path (Join-Path $DestinationPath 'manad.csv') -Rows @($csvRows) `
+            -Header 'manad', 'kedja', 'antal_kvitton', 'summa_total', 'summa_sparat', 'antal_varor'
     }
-    Write-CsvFile -Path (Join-Path $DestinationPath 'manad.csv') -Rows @($csvRows) `
-        -Header 'manad', 'kedja', 'antal_kvitton', 'summa_total', 'summa_sparat', 'antal_varor'
+}
+finally {
+    foreach ($envName in $envCookies.Keys) {
+        [System.Environment]::SetEnvironmentVariable($envName, $envCookies[$envName])
+    }
 }
