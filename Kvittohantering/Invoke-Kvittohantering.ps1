@@ -49,8 +49,11 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.0.1
+    Version:   1.1.0
     Changelog:
+        1.1.0 - D-02: nedladdning via .part + Move, ingen halv fil under slutnamnet.
+                D-03: samma datum/butik/belopp får suffix _2, _3 (filnamnsschemat utökas bakåtkompatibelt).
+                S-01: cookiens värde skrivs inte ut i varning.
         1.0.1 - D-01: avbryter om pdftotext saknas och spärrar skrivning av månader (samt manad.*)
                 med otolkbara råkvitton, så att tidigare bra filer inte skrivs över.
         1.0.0 - Utgångspunkt: befintligt script, ingen funktionell ändring.
@@ -375,7 +378,8 @@ function New-CookieSession {
             $jar.Add([System.Net.Cookie]::new($name, $value, '/', $Domain))
         }
         catch {
-            Write-Warning "Cookie '$name' kunde inte läggas till: $($PSItem.Exception.Message)"
+            # Inte Exception.Message: CookieException citerar cookiens värde i klartext
+            Write-Warning "Cookie '$name' kunde inte läggas till (ogiltigt tecken i värdet)."
         }
     }
     $session.Cookies = $jar
@@ -623,14 +627,16 @@ function Save-WillysKvitto {
         if ($tx.Count -lt $pageSize) { break }
     }
 
+    # Sorterad så att suffixen (_2, _3) tilldelas lika vid varje körning, oavsett API:ts ordning
     $withReceipt = @($all | Where-Object {
             (Get-PropertyValue $_ 'digitalReceiptAvailable') -and (Get-PropertyValue $_ 'digitalReceiptReference')
-        })
+        } | Sort-Object -Property { [long](Get-PropertyValue $_ 'bookingDate') }, { [string](Get-PropertyValue $_ 'digitalReceiptReference') })
     $result = [pscustomobject]@{ Kedja = 'Willys'; Hittade = $withReceipt.Count; Nya = 0; Fanns = 0; Misslyckade = 0 }
     if ($withReceipt.Count -eq 0) { return $result }
     if (-not $PSCmdlet.ShouldProcess($OutputDir, "Ladda ner upp till $($withReceipt.Count) Willys-kvitton")) { return $result }
 
     [void][System.IO.Directory]::CreateDirectory($OutputDir)
+    $nameCount = @{}   # samma datum+butik+belopp flera gånger i listan -> _2, _3 ...
     $i = 0
     foreach ($t in $withReceipt) {
         $i++
@@ -640,7 +646,10 @@ function Save-WillysKvitto {
         $date     = [DateTimeOffset]::FromUnixTimeMilliseconds([long](Get-PropertyValue $t 'bookingDate')).ToLocalTime().ToString('yyyy-MM-dd', $script:Inv)
         $store    = Get-SafeName (Get-PropertyValue $t 'storeName')
         $amount   = "$(Get-PropertyValue $t 'amount')" -replace '[,\s]', '_'
-        $fileName = Join-Path $OutputDir "${date}_${store}_${amount}kr.pdf"
+        $baseName = "${date}_${store}_${amount}kr"
+        $nameCount[$baseName] = 1 + [int]$nameCount[$baseName]
+        if ($nameCount[$baseName] -gt 1) { $baseName += "_$($nameCount[$baseName])" }
+        $fileName = Join-Path $OutputDir "$baseName.pdf"
 
         if (Test-Path -LiteralPath $fileName) { $result.Fanns++; continue }
 
@@ -650,13 +659,18 @@ function Save-WillysKvitto {
                    "?date=$date&storeId=$(Get-PropertyValue $t 'storeCustomerId')&source=$source&memberCardNumber=$(Get-PropertyValue $t 'memberCardNumber')"
 
         try {
-            Invoke-KvittoRequest -Uri $uri -Headers $headers -Session $session -OutFile $fileName
-            $bytes = [System.IO.File]::ReadAllBytes($fileName)
-            $magic = $bytes.Length -ge 4 ? [System.Text.Encoding]::ASCII.GetString($bytes, 0, 4) : ''
-            if ($magic -ne '%PDF') {
-                [System.IO.File]::Delete($fileName)
+            # Ladda ner till .part och byt namn först när filen är verifierad. Ett avbrott
+            # lämnar då aldrig en halv PDF under slutnamnet, som nästa körning skulle hoppa över.
+            $partFile = "$fileName.part"
+            Invoke-KvittoRequest -Uri $uri -Headers $headers -Session $session -OutFile $partFile
+            $head = [byte[]]::new(4)
+            $fs   = [System.IO.File]::OpenRead($partFile)
+            try { $read = $fs.Read($head, 0, 4) } finally { $fs.Dispose() }
+            if ($read -lt 4 -or [System.Text.Encoding]::ASCII.GetString($head) -ne '%PDF') {
+                [System.IO.File]::Delete($partFile)
                 throw [System.UnauthorizedAccessException]::new('Willys returnerade inte en PDF - sessionen har troligen gått ut.')
             }
+            [System.IO.File]::Move($partFile, $fileName)   # utan överskrivning: kastar om slutnamnet finns
             $result.Nya++
             Write-Verbose "Willys: $(Split-Path $fileName -Leaf)"
         }
@@ -731,11 +745,15 @@ function Save-LidlKvitto {
         if ($allOlder -or $seen -ge $total) { break }
     }
 
+    # Sorterad så att suffixen (_2, _3) tilldelas lika vid varje körning, oavsett API:ts ordning
+    $inRange = [System.Collections.Generic.List[object]]::new(
+        [object[]]@($inRange | Sort-Object -Property { ([DateTimeOffset](Get-PropertyValue $_ 'date')).UtcTicks }, { [string](Get-PropertyValue $_ 'id') }))
     $result = [pscustomobject]@{ Kedja = 'Lidl'; Hittade = $inRange.Count; Nya = 0; Fanns = 0; Misslyckade = 0 }
     if ($inRange.Count -eq 0) { return $result }
     if (-not $PSCmdlet.ShouldProcess($OutputDir, "Ladda ner upp till $($inRange.Count) Lidl-kvitton")) { return $result }
 
     [void][System.IO.Directory]::CreateDirectory($OutputDir)
+    $nameCount = @{}   # samma datum+butik+belopp flera gånger i listan -> _2, _3 ...
     $i = 0
     foreach ($tk in $inRange) {
         $i++
@@ -746,6 +764,8 @@ function Save-LidlKvitto {
         $store    = Get-SafeName (Get-PropertyValue $tk 'store')
         $amount   = "$(Get-PropertyValue $tk 'totalAmount')" -replace '[,\s]', '_'
         $baseName = "${date}_${store}_${amount}kr"
+        $nameCount[$baseName] = 1 + [int]$nameCount[$baseName]
+        if ($nameCount[$baseName] -gt 1) { $baseName += "_$($nameCount[$baseName])" }
         $jsonFile = Join-Path $OutputDir "$baseName.json"
         $htmlFile = Join-Path $OutputDir "$baseName.html"
 
@@ -755,9 +775,15 @@ function Save-LidlKvitto {
             $id     = [Uri]::EscapeDataString([string](Get-PropertyValue $tk 'id'))
             $detail = Invoke-KvittoRequest -Uri "https://www.lidl.se/mre/api/v1/tickets/${id}?country=SE&languageCode=sv-SE" -Headers $headers -Session $session
             Assert-JsonSvar -Response $detail -ExpectedProperty 'ticket' -Chain 'Lidl'
-            [System.IO.File]::WriteAllText($jsonFile, (ConvertTo-Json -InputObject $detail -Depth 20), $script:Utf8NoBom)
+            # HTML först (bara om den inte finns), sedan JSON sist: JSON-filen är markören för "klart".
+            # Båda skrivs till .part och byts namn utan överskrivning, så ett avbrott lämnar ingen halv slutfil.
             $html = Get-PropertyValue (Get-PropertyValue $detail 'ticket') 'htmlPrintedReceipt'
-            if ($html) { [System.IO.File]::WriteAllText($htmlFile, [string]$html, $script:Utf8NoBom) }
+            if ($html -and -not (Test-Path -LiteralPath $htmlFile)) {
+                [System.IO.File]::WriteAllText("$htmlFile.part", [string]$html, $script:Utf8NoBom)
+                [System.IO.File]::Move("$htmlFile.part", $htmlFile)
+            }
+            [System.IO.File]::WriteAllText("$jsonFile.part", (ConvertTo-Json -InputObject $detail -Depth 20), $script:Utf8NoBom)
+            [System.IO.File]::Move("$jsonFile.part", $jsonFile)
             $result.Nya++
             Write-Verbose "Lidl: $baseName"
         }
@@ -954,7 +980,7 @@ function ConvertFrom-WillysKvitto {
     # - butik: alltid därifrån (korrekta åäö, samma format oavsett kvittots årgång)
     # - datum/total: reserv om PDF-texten saknar dem
     $mf = [regex]::Match($File.Name.Normalize([System.Text.NormalizationForm]::FormC),
-        '^(?<d>\d{4}-\d{2}-\d{2})_(?<s>.+)_(?<a>\d+(?:\.\d+)?)kr\.pdf$')
+        '^(?<d>\d{4}-\d{2}-\d{2})_(?<s>.+)_(?<a>\d+(?:\.\d+)?)kr(?:_\d+)?\.pdf$')
     if ($mf.Success) {
         $store = $mf.Groups['s'].Value.Replace('_', ' ')
         if (-not $date) { $date = $mf.Groups['d'].Value }
