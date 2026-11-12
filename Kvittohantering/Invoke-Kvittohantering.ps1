@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Hämtar digitala kvitton från Willys och Lidl, normaliserar dem och sorterar dem per år/månad.
 
@@ -52,8 +52,12 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.6.0
+    Version:   1.6.1
     Changelog:
+        1.6.1 - E-01: originalkopior hoppas över när målet har samma längd och ändringstid. E-02: Get-LidlRawFile.
+                E-03: $InformationPreference, Export-KvittoGrupp, förenklad Get-SafeName. E-04: BOM i filen och
+                OutputType på ConvertTo-Array (PSScriptAnalyzer utan anmärkningar). Ingen funktionell ändring
+                utöver E-01.
         1.6.0 - D-06: Lidls råkvitto (JSON) sparas byte-exakt som kedjan skickade det, i stället för
                 omserialiserat. Gäller bara nya nedladdningar; befintliga filer rörs inte.
         1.5.0 - U-02: belopp i filnamn saneras, frågeparametrar kodas, negativa belopp tillåts i filnamnsregexen.
@@ -132,6 +136,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$InformationPreference = 'Continue'   # Write-Information visas utan -InformationAction på varje anrop
 
 # --------------------------------------------------------------------------
 # Konstanter
@@ -342,6 +347,7 @@ function Get-PropertyValue {
 function ConvertTo-Array {
     # Gör om null/enstaka objekt till en riktig array (undviker fantomrader från @($null))
     [CmdletBinding()]
+    [OutputType([object[]])]
     param([AllowNull()]$InputObject)
 
     if ($null -eq $InputObject) { return , @() }
@@ -398,12 +404,12 @@ function ConvertTo-SvenskTid {
 }
 
 function Get-SafeName {
-    # Filnamnssäker butiksnamn (behåller åäö - samma schema som tidigare nedladdningar)
+    # Filnamnssäker butiksnamn (\w täcker åäö - samma schema som tidigare nedladdningar)
     [CmdletBinding()]
     [OutputType([string])]
     param([AllowNull()][AllowEmptyString()][string]$Name)
 
-    return (($Name -replace '[^\w\såäöÅÄÖ-]', '') -replace '\s+', '_')
+    return (($Name -replace '[^\w\s-]', '') -replace '\s+', '_')
 }
 
 # ==========================================================================
@@ -549,7 +555,7 @@ function Initialize-Kvittowebblasare {
     [void][System.IO.Directory]::CreateDirectory($script:AppDir, $script:AppDirMode)
 
     if (-not (Test-Path -LiteralPath $python)) {
-        Write-Information 'Skapar Python-miljö...' -InformationAction Continue
+        Write-Information 'Skapar Python-miljö...'
         & $sysPython -m venv (Join-Path $script:AppDir 'venv') | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "python3 -m venv misslyckades (kod $LASTEXITCODE)" }
     }
@@ -558,11 +564,11 @@ function Initialize-Kvittowebblasare {
     if ($pyVersion -lt $script:PlaywrightMinPython) {
         throw "Playwright $($script:PlaywrightVersion) kräver Python $($script:PlaywrightMinPython)+, men venv har $pyVersion."
     }
-    Write-Information 'Installerar Playwright...' -InformationAction Continue
+    Write-Information 'Installerar Playwright...'
     & $python -m pip install --quiet --disable-pip-version-check "playwright==$($script:PlaywrightVersion)" | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "pip install playwright misslyckades (kod $LASTEXITCODE)" }
 
-    Write-Information "Laddar ner $Browser..." -InformationAction Continue
+    Write-Information "Laddar ner $Browser..."
     $installArgs = @('-m', 'playwright', 'install', $Browser)
     if ($Browser -eq 'chromium') { $installArgs += '--no-shell' }   # hoppa över headless-varianten
     & $python @installArgs | Out-Host
@@ -616,9 +622,21 @@ function Get-KvittoCookieAutomatisk {
 
     # Willys först (BankID tar längst), sedan Lidl så att Lidl-tokenen är så färsk som möjligt
     $order = @('willys', 'lidl') | Where-Object { $_ -in $Chain }
-    Write-Information 'Öppnar webbläsarfönster - logga in om du blir ombedd.' -InformationAction Continue
+    Write-Information 'Öppnar webbläsarfönster - logga in om du blir ombedd.'
     $helperArgs = @('cookies', '--profile', (Join-Path $script:AppDir 'profil'), '--browser', $Browser, '--chains') + $order
     return Invoke-Kvittohjalpare -Browser $Browser -Arguments $helperArgs
+}
+
+function Get-LidlRawFile {
+    # E-02: Lidls råkvitton (JSON) i en mapp, sorterade på namn. Tom lista om mappen saknas.
+    [CmdletBinding()]
+    [OutputType([System.IO.FileInfo])]
+    param([Parameter(Mandatory)][string]$LidlDir)
+
+    if (-not (Test-Path -LiteralPath $LidlDir -PathType Container)) { return }
+    Get-ChildItem -LiteralPath $LidlDir -Filter '*.json' -File |
+        Where-Object { $_.Name -ne 'kvittolista.json' } |
+        Sort-Object -Property Name
 }
 
 function ConvertTo-LidlPdf {
@@ -628,10 +646,8 @@ function ConvertTo-LidlPdf {
     [OutputType([int])]
     param([Parameter(Mandatory)][string]$LidlDir)
 
-    $pending = @(Get-ChildItem -LiteralPath $LidlDir -Filter '*.json' -File |
-            Where-Object { $_.Name -ne 'kvittolista.json' -and
-                -not (Test-Path -LiteralPath ([System.IO.Path]::ChangeExtension($_.FullName, '.pdf'))) } |
-            Sort-Object -Property Name)
+    $pending = @(Get-LidlRawFile -LidlDir $LidlDir |
+            Where-Object { -not (Test-Path -LiteralPath ([System.IO.Path]::ChangeExtension($_.FullName, '.pdf'))) })
     if ($pending.Count -eq 0) { return 0 }
     if (-not $PSCmdlet.ShouldProcess($LidlDir, "Skapa $($pending.Count) PDF:er av Lidl-kvitton")) { return 0 }
 
@@ -653,7 +669,7 @@ function ConvertTo-LidlPdf {
     }
     if ($jobs.Count -eq 0) { return 0 }
 
-    Write-Information "Skapar $($jobs.Count) Lidl-PDF:er..." -InformationAction Continue
+    Write-Information "Skapar $($jobs.Count) Lidl-PDF:er..."
     $jobFile = [System.IO.Path]::GetTempFileName()
     try {
         [System.IO.File]::WriteAllText($jobFile, (ConvertTo-Json -InputObject @($jobs) -Depth 20), $script:Utf8NoBom)
@@ -1227,13 +1243,21 @@ function Copy-FilAtomiskt {
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination
     )
+    # E-01: hoppa över när målet redan har samma längd och ändringstid (färre skrivningar och
+    # mindre synkning mot iCloud/Paperless)
+    $src = [System.IO.FileInfo]::new($Source)
+    $dst = [System.IO.FileInfo]::new($Destination)
+    if ($dst.Exists -and $dst.Length -eq $src.Length -and $dst.LastWriteTimeUtc -eq $src.LastWriteTimeUtc) { return }
+
     $tmp = "$Destination.tmp"
     [System.IO.File]::Copy($Source, $tmp, $true)
+    [System.IO.File]::SetLastWriteTimeUtc($tmp, $src.LastWriteTimeUtc)   # så att nästa körning känner igen kopian
     [System.IO.File]::Move($tmp, $Destination, $true)
 }
 
 function Write-CsvFile {
-    # Semikolonseparerad CSV med UTF-8 BOM (krävs för åäö i Excel för Mac)
+    # Semikolonseparerad CSV med UTF-8 BOM (krävs för åäö i Excel för Mac).
+    # Rubrikerna tas från objekten i $Rows; -Header används bara när det inte finns några rader.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -1300,6 +1324,22 @@ function Export-KvittoMapp {
     }
 }
 
+function Export-KvittoGrupp {
+    # E-03: gemensam skrivning för månadsmappar och Odaterade (samma ShouldProcess + Export + resultatobjekt)
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Folder,
+        [Parameter(Mandatory)][object[]]$Receipts,
+        [Parameter(Mandatory)][string]$Manad,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Beskrivning
+    )
+    if ($PSCmdlet.ShouldProcess($Folder, "Skriv $($Receipts.Count) $Beskrivning kvitton")) {
+        Export-KvittoMapp -Folder $Folder -Receipts $Receipts -Source $Source
+        [pscustomobject]@{ Manad = $Manad; Kvitton = $Receipts.Count; Mapp = $Folder }
+    }
+}
+
 # ##########################################################################
 # HUVUDFLÖDE
 # ##########################################################################
@@ -1348,7 +1388,7 @@ try {
                 Write-Warning "Cookie saknas för $($saknas -join ' och ') (WILLYS_COOKIE / LIDL_COOKIE) - kedjan hoppas över."
             }
             elseif ($saknas.Count -gt 0) {
-                Write-Information 'Klistra in Cookie-raden från webbläsarens nätverksflik. Tomt = hoppa över kedjan.' -InformationAction Continue
+                Write-Information 'Klistra in Cookie-raden från webbläsarens nätverksflik. Tomt = hoppa över kedjan.'
                 if ('Willys' -in $saknas) { $willysCookie = Read-Host -Prompt 'Willys-cookie (från willys.se/mina-kop)' -MaskInput }
                 if ('Lidl' -in $saknas)   { $lidlCookie   = Read-Host -Prompt 'Lidl-cookie (från ett mre/api-anrop, hämta precis innan)' -MaskInput }
             }
@@ -1360,7 +1400,7 @@ try {
 
         # Lidl först - dess token lever bara ca 30 minuter
         if (-not [string]::IsNullOrWhiteSpace($lidlCookie)) {
-            Write-Information 'Hämtar Lidl-kvitton...' -InformationAction Continue
+            Write-Information 'Hämtar Lidl-kvitton...'
             try {
                 $downloads.Add((Save-LidlKvitto -CookieString $lidlCookie -OutputDir (Join-Path $RawPath 'lidl') -From $FromDate -To $ToDate))
             }
@@ -1373,7 +1413,7 @@ try {
         }
 
         if (-not [string]::IsNullOrWhiteSpace($willysCookie)) {
-            Write-Information 'Hämtar Willys-kvitton...' -InformationAction Continue
+            Write-Information 'Hämtar Willys-kvitton...'
             try {
                 $downloads.Add((Save-WillysKvitto -CookieString $willysCookie -OutputDir (Join-Path $RawPath 'willys') -From $FromDate -To $ToDate))
             }
@@ -1393,7 +1433,7 @@ try {
 
         foreach ($d in $downloads) {
             Write-Information ('{0}: {1} i perioden, {2} nya, {3} fanns redan, {4} misslyckade' -f
-                $d.Kedja, $d.Hittade, $d.Nya, $d.Fanns, $d.Misslyckade) -InformationAction Continue
+                $d.Kedja, $d.Hittade, $d.Nya, $d.Fanns, $d.Misslyckade)
         }
     }
 
@@ -1404,7 +1444,7 @@ try {
     if (-not $SkipPdf -and (Test-Path -LiteralPath $lidlRawDir -PathType Container)) {
         try {
             $created = ConvertTo-LidlPdf -LidlDir $lidlRawDir
-            if ($created -gt 0) { Write-Information "Skapade $created Lidl-PDF:er." -InformationAction Continue }
+            if ($created -gt 0) { Write-Information "Skapade $created Lidl-PDF:er." }
         }
         catch {
             Write-Warning "Lidl-PDF:er kunde inte skapas: $($PSItem.Exception.Message) Normaliseringen fortsätter."
@@ -1459,12 +1499,7 @@ try {
     }
 
     # Lidl
-    $lidlDir   = Join-Path $RawPath 'lidl'
-    $jsonFiles = @(if (Test-Path -LiteralPath $lidlDir) {
-            Get-ChildItem -LiteralPath $lidlDir -Filter '*.json' -File |
-                Where-Object { $_.Name -ne 'kvittolista.json' } |
-                Sort-Object -Property Name
-        })
+    $jsonFiles = @(Get-LidlRawFile -LidlDir $lidlRawDir)
     foreach ($js in $jsonFiles) {
         try {
             $receipts.Add((ConvertFrom-LidlKvitto -File $js))
@@ -1508,7 +1543,7 @@ try {
         Write-Warning "Inga kvitton att normalisera i $RawPath"
         return
     }
-    Write-Information "Normaliserar $($receipts.Count) kvitton..." -InformationAction Continue
+    Write-Information "Normaliserar $($receipts.Count) kvitton..."
 
     # Kontrollsumma per kvitto: rader + rabatter mot total
     foreach ($r in $receipts) {
@@ -1538,10 +1573,7 @@ try {
             continue
         }
 
-        if ($PSCmdlet.ShouldProcess($folder, "Skriv $($group.Count) normaliserade kvitton")) {
-            Export-KvittoMapp -Folder $folder -Receipts @($group.Group) -Source $RawPath
-            [pscustomobject]@{ Manad = "$year/$mname"; Kvitton = $group.Count; Mapp = $folder }
-        }
+        Export-KvittoGrupp -Folder $folder -Receipts @($group.Group) -Manad "$year/$mname" -Source $RawPath -Beskrivning 'normaliserade'
     }
 
     if ($undated.Count -gt 0 -and $blockedMonths.Contains('Odaterade')) {
@@ -1550,10 +1582,7 @@ try {
     elseif ($undated.Count -gt 0) {
         $folder = Join-Path $DestinationPath 'Odaterade'
         Write-Warning "$($undated.Count) kvitton saknar tolkbart datum och läggs i $folder"
-        if ($PSCmdlet.ShouldProcess($folder, "Skriv $($undated.Count) odaterade kvitton")) {
-            Export-KvittoMapp -Folder $folder -Receipts $undated -Source $RawPath
-            [pscustomobject]@{ Manad = 'Odaterade'; Kvitton = $undated.Count; Mapp = $folder }
-        }
+        Export-KvittoGrupp -Folder $folder -Receipts $undated -Manad 'Odaterade' -Source $RawPath -Beskrivning 'odaterade'
     }
 
     # Översikt per månad och kedja
