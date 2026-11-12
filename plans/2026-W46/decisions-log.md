@@ -21,6 +21,42 @@
   eller nedladdning under arbetet. Poster som rör vid en regel har raden **Flagga**.
 - Ta posterna i den ordning de står. Alla har status `föreslagen`.
 
+## Akut: regression efter 1.3.0
+
+### L-04 Låst Playwright-version går inte att installera på Python 3.9
+- Status: föreslagen | Område: leveranskedja | Allvarlighet: hög (blockerar `-AutoCookie` och Lidl-PDF) | Underlag: användarens felutskrift + PyPI-metadata
+- Var: `$script:PlaywrightVersion = '1.65.1'` (rad 156), `Initialize-Kvittowebblasare` (rad 525-544)
+- Symptom: `No matching distribution found for playwright==1.65.1`; pip listar versioner till och med 1.60.0.
+- Orsak: Playwright 1.61.0 och senare kräver Python 3.10 (`requires_python >=3.10`), 1.60.0
+  är sista versionen för 3.9. venv:en är skapad med `python3` från PATH, som på macOS
+  normalt är Xcodes Python 3.9. Versionen 1.65.1 finns på PyPI, men pip visar bara det som
+  passar tolken. Markörfilen saknade versionen, så 1.3.0 tvingade fram en ominstallation
+  av en installation som fungerade.
+- Åtgärd nu (egen liten PR, 1.4.1): lås till 1.60.0 och ge ett begripligt fel om tolken är för gammal.
+
+```diff
+-$script:PlaywrightVersion = '1.65.1'
++# 1.60.0 är sista versionen som stöder Python 3.9 (Xcodes python3). 1.61+ kräver Python 3.10.
++$script:PlaywrightVersion   = '1.60.0'
++$script:PlaywrightMinPython = [version]'3.9'
+```
+```diff
+         if ($LASTEXITCODE -ne 0) { throw "python3 -m venv misslyckades (kod $LASTEXITCODE)" }
+     }
++    # pip listar bara versioner som passar tolken, så felet blir annars obegripligt
++    $pyVersion = [version](& $python -c 'import sys; print("%d.%d" % sys.version_info[:2])')
++    if ($pyVersion -lt $script:PlaywrightMinPython) {
++        throw "Playwright $($script:PlaywrightVersion) kräver Python $($script:PlaywrightMinPython)+, men venv har $pyVersion."
++    }
+     Write-Information 'Installerar Playwright...' -InformationAction Continue
+```
+- Klart när: `-AutoCookie` startar på en Mac där `python3 --version` ger 3.9.x, utan att
+  AppDir raderas först.
+- Lärdom för kommande låsningar: kontrollera vald version med venv:ens egen pip
+  (`& $python -m pip index versions playwright`), inte mot PyPI i allmänhet.
+- Uppföljning (medel, eget beslut): Python 3.9 är utgånget och 1.60.0 fryser webbläsaren
+  som används för BankID. Se F-07.
+
 ## Att verifiera innan något annat (V)
 
 ### V-01 Klistringsartefakter i underlaget
@@ -462,3 +498,11 @@ Större ändringar. Tas inte som fynd; kräver eget beslut.
 ### F-06 Dela upp scriptet i modul + tunt startscript
 - Status: föreslagen. För: testbart, kedjorna i egna filer. Mot: ett script blir flera;
   görs lämpligast först efter N-01.
+
+### F-07 Kräv Python 3.10+ för venv:en
+- Status: föreslagen. Leta upp nyaste `python3.1x` (Homebrew, python.org) före `python3`,
+  och bygg om venv:en när dess tolk är äldre än 3.10. Då kan Playwright-låsningen höjas
+  förbi 1.60.0.
+  För: webbläsaren som används för BankID kan hållas uppdaterad. Mot: Xcodes python3
+  räcker inte längre, så användaren måste installera Python (`brew install python`);
+  venv och webbläsare laddas ner på nytt en gång.
