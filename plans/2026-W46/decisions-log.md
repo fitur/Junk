@@ -1,0 +1,440 @@
+# Decisions log 2026-W46: Invoke-Kvittohantering.ps1
+
+Överlämning från Arkitekt-sessionen (2026-11-12) till Utförar-sessionen.
+
+## Läs detta först
+
+- Granskningen gjordes på scriptet som det klistrades in i chatten. Filen finns inte i
+  `fitur/junk`, så platser anges som funktion + kodrad i citat, inte radnummer.
+- PowerShell fanns inte i granskningsmiljön och fick inte installeras. Inget är alltså kört
+  i pwsh och PSScriptAnalyzer är inte körd. Beloppsregexen är testad i Python `re`, som har
+  samma semantik för de konstruktioner som används.
+- **Underlag** per post: `kod` = följer direkt av koden, `kod+.NET` = följer av koden plus
+  dokumenterat .NET/Playwright-beteende som inte kunnat köras här, `antagande` = beror på
+  hur kedjan faktiskt svarar.
+- Hårda regler som gäller alla poster: inga nya cookies/tokens/kvittodata på disk, råkvitton
+  i RawPath raderas eller skrivs aldrig över, svenska kommentarer, PS 7.4+, ingen inloggning
+  eller nedladdning under arbetet. Poster som rör vid en regel har raden **Flagga**.
+- Ta posterna i den ordning de står. Alla har status `föreslagen`.
+
+## Att verifiera innan något annat (V)
+
+### V-01 Klistringsartefakter i underlaget
+- Status: föreslagen | Allvarlighet: kritisk om de finns i filen, annars ingen
+- Var: `Save-WillysKvitto`/`Save-LidlKvitto` (`-Domain '[www.willys.se](https://www.willys.se)'`),
+  `$script:AmountPos` (teckenklassen `[ .  ]`)
+- Problem: domänen står som markdown-länk och teckenklassen har blanksteg av okänd typ.
+- Åtgärd: kontrollera i den riktiga filen. Domänen ska vara `'www.willys.se'` / `'www.lidl.se'`.
+  Teckenklassen ska vara blanksteg, punkt, U+00A0 och U+202F; skriv dem som `  `
+  så att de överlever kopiering.
+
+## Prioritet 1: hög
+
+### D-01 Normaliseringen skriver över månadsfiler med ofullständigt underlag
+- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Var: huvudflödet, steg 2 (`if (-not $pdfToText) { Write-Warning ... }` och `catch`-blocken
+  runt `ConvertFrom-WillysKvitto`/`ConvertFrom-LidlKvitto`)
+- Problem: alla månadsmappar skrivs om från noll vid varje körning. Saknas pdftotext hoppas
+  samtliga Willys-kvitton över med en varning, och sedan skrivs `kvitton.json`, `varor.csv`
+  och `manad.*` för hela historiken utan Willys. Samma sak i liten skala när ett enskilt
+  kvitto inte går att tolka.
+- Åtgärd:
+  1. Saknas pdftotext och det finns Willys-PDF:er: `throw` innan något skrivs.
+  2. Samla misslyckade filer. Månaden går att läsa ur filnamnets datumprefix; hoppa över
+     skrivning av de månaderna och av `manad.*`, och varna med fillistan.
+
+```diff
+     $pdfToText = Find-PdfToText -Hint $PdfToTextPath
+     if (-not $pdfToText) {
+-        Write-Warning "pdftotext saknas - $($pdfFiles.Count) Willys-kvitton hoppas över. Installera med: brew install poppler"
++        # Avbryt före skrivning: annars skrivs alla månadsfiler om utan Willys-kvitton
++        throw "pdftotext saknas - $($pdfFiles.Count) Willys-kvitton kan inte tolkas. Installera med: brew install poppler"
+     }
+-    else {
+-        Write-Verbose "Använder pdftotext: $pdfToText"
+-        foreach ($pdf in $pdfFiles) {
+-            try {
+-                $receipts.Add((ConvertFrom-WillysKvitto -File $pdf -PdfToText $pdfToText))
+-            }
+-            catch {
+-                Write-Warning "Willys $($pdf.Name): $($PSItem.Exception.Message)"
+-            }
++    Write-Verbose "Använder pdftotext: $pdfToText"
++    foreach ($pdf in $pdfFiles) {
++        try {
++            $receipts.Add((ConvertFrom-WillysKvitto -File $pdf -PdfToText $pdfToText))
++        }
++        catch {
++            # Månaden (ur filnamnet) spärras för skrivning, så att en tidigare bra fil står kvar
++            [void]$blockedMonths.Add($pdf.Name.Substring(0, 7))
++            Write-Warning "Willys $($pdf.Name): $($PSItem.Exception.Message)"
+         }
+     }
+```
+  `$blockedMonths` är ett `HashSet[string]` som skapas före Willys-blocket, fylls på samma
+  sätt i Lidl-`catch`, och kontrolleras i månadsloopen (`if ($blockedMonths.Contains($group.Name)) { varna; continue }`)
+  samt före `manad.*`.
+- Klart när: körning utan pdftotext lämnar DestinationPath orörd.
+
+### D-02 Avbruten nedladdning lämnar en halv fil under slutnamnet
+- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Var: `Save-WillysKvitto` (`Invoke-KvittoRequest ... -OutFile $fileName`), `Save-LidlKvitto`
+  (`WriteAllText($jsonFile ...)`)
+- Problem: PDF:en strömmas direkt till slutnamnet. Bryts körningen eller anslutningen
+  mitt i ligger filen kvar, nästa körning räknar den som "fanns redan", och pdftotext
+  misslyckas på den för alltid. Det generella `catch`-blocket städar inte heller.
+- Åtgärd: ladda ner till `<namn>.part`, verifiera, byt namn utan överskrivning.
+
+```diff
+         try {
+-            Invoke-KvittoRequest -Uri $uri -Headers $headers -Session $session -OutFile $fileName
+-            $bytes = [System.IO.File]::ReadAllBytes($fileName)
+-            $magic = $bytes.Length -ge 4 ? [System.Text.Encoding]::ASCII.GetString($bytes, 0, 4) : ''
+-            if ($magic -ne '%PDF') {
+-                [System.IO.File]::Delete($fileName)
++            # Ladda ner till .part och byt namn först när filen är verifierad. Ett avbrott
++            # lämnar då aldrig en halv PDF under slutnamnet, som nästa körning skulle hoppa över.
++            $partFile = "$fileName.part"
++            Invoke-KvittoRequest -Uri $uri -Headers $headers -Session $session -OutFile $partFile
++            $head = [byte[]]::new(4)
++            $fs   = [System.IO.File]::OpenRead($partFile)
++            try { $read = $fs.Read($head, 0, 4) } finally { $fs.Dispose() }
++            if ($read -lt 4 -or [System.Text.Encoding]::ASCII.GetString($head) -ne '%PDF') {
++                [System.IO.File]::Delete($partFile)
+                 throw [System.UnauthorizedAccessException]::new('Willys returnerade inte en PDF - sessionen har troligen gått ut.')
+             }
++            [System.IO.File]::Move($partFile, $fileName)   # utan överskrivning: kastar om slutnamnet finns
+             $result.Nya++
+```
+  Lidl: skriv HTML först (bara om den inte finns), sedan JSON till `.part` + `Move`. JSON-filen
+  är markören för "klart", så den ska komma sist.
+- Flagga: `.part`-filer är tillfälliga filer i RawPath. De skrivs över vid nästa försök, men
+  de är aldrig färdiga råkvitton. Slutnamn skrivs aldrig över (`Move` utan overwrite).
+- Klart när: Ctrl+C mitt i en nedladdning ger ingen `*.pdf`/`*.json` för det kvittot.
+
+### D-03 Två kvitton med samma datum, butik och belopp: det andra hämtas aldrig
+- Status: föreslagen | Område: dataintegritet | Underlag: kod (hur ofta det händer: antagande)
+- Var: `Save-WillysKvitto` och `Save-LidlKvitto` (`if (Test-Path -LiteralPath ...) { $result.Fanns++; continue }`)
+- Problem: filnamnet är enda identiteten. Två köp samma dag i samma butik på samma summa
+  ger samma namn, det andra räknas som "fanns redan" och försvinner tyst.
+- Åtgärd: räknare per körning; andra förekomsten i listan får `_2`, tredje `_3`. Listan är
+  sorterad, så tilldelningen blir densamma mellan körningar. Befintliga filer behåller namn.
+
+```diff
++    $nameCount = @{}   # samma datum+butik+belopp flera gånger i listan -> _2, _3 ...
+     foreach ($t in $withReceipt) {
+ ...
+-        $fileName = Join-Path $OutputDir "${date}_${store}_${amount}kr.pdf"
++        $baseName = "${date}_${store}_${amount}kr"
++        $nameCount[$baseName] = 1 + [int]$nameCount[$baseName]
++        if ($nameCount[$baseName] -gt 1) { $baseName += "_$($nameCount[$baseName])" }
++        $fileName = Join-Path $OutputDir "$baseName.pdf"
+```
+  Följdändring i `ConvertFrom-WillysKvitto`: filnamnsregexen ska sluta på `kr(?:_\d+)?\.pdf$`.
+  Samma räknare i `Save-LidlKvitto`.
+- Flagga: filnamnsschemat utökas (bakåtkompatibelt). Stabiliteten förutsätter att båda
+  kvittona ligger i samma datumintervall, vilket de gör eftersom datumet ingår i namnet.
+
+### S-01 Cookie-värde kan skrivas ut i varning
+- Status: föreslagen | Område: säkerhet | Underlag: kod+.NET (ej kört)
+- Var: `New-CookieSession` (`Write-Warning "Cookie '$name' kunde inte läggas till: $($PSItem.Exception.Message)"`)
+- Problem: `CookieContainer.Add` kastar `CookieException` med texten
+  `The 'Value'='<värdet>' part of the cookie is invalid.` när värdet innehåller komma eller
+  semikolon utan citattecken. Värdet hamnar då i terminalen och i en eventuell transcript.
+- Åtgärd:
+
+```diff
+-            Write-Warning "Cookie '$name' kunde inte läggas till: $($PSItem.Exception.Message)"
++            # Inte Exception.Message: CookieException citerar cookiens värde i klartext
++            Write-Warning "Cookie '$name' kunde inte läggas till (ogiltigt tecken i värdet)."
+```
+- Bekräfta först i pwsh: `[System.Net.CookieContainer]::new().Add([System.Net.Cookie]::new('a','x,y','/','example.com'))`.
+- Bieffekt att känna till: sådana cookies skickas inte alls. Är det en sessionscookie
+  ser det ut som utgången session.
+
+## Prioritet 2: medel
+
+### U-01 Lidl-HTML renderas med script och nätverk påslaget
+- Status: föreslagen | Område: opålitlig data | Underlag: kod
+- Var: Python `render_receipt` / `cmd_pdf` (`page.set_content(doc, wait_until="load")`)
+- Problem: innehållet i `<pre>` klistras in oescapat. `<script>`, `<img src=...>`, `<link>`
+  och `<meta refresh>` i kvittotexten körs respektive hämtas. Sidan har ingen åtkomst till
+  inloggningsprofilen (ny kontext, about:blank), så skadan begränsas till externa anrop,
+  ändrat kvittoinnehåll och hängande `load`.
+- Åtgärd:
+
+```diff
+-            page = browser.new_page()
++            # Kvitto-HTML är opålitlig data: inga script och inget nätverk vid rendering
++            ctx = browser.new_context(java_script_enabled=False, offline=True)
++            ctx.route("**/*", lambda route: route.abort())
++            page = ctx.new_page()
+```
+- Testa att `set_content` och `bounding_box` fungerar med JS avstängt (Playwright kör sin
+  egen kod via CDP, så det ska fungera, men det är inte kört här).
+- Relaterat: `re.search(r"<pre>(.*?)</pre>")` tar bara första `<pre>`. Har Lidl flera block
+  blir PDF:en avkortad (antagande, kontrollera mot ett sparat kvitto).
+
+### S-02 Cookies i miljövariabler ärvs av alla barnprocesser
+- Status: föreslagen | Område: säkerhet | Underlag: kod
+- Var: huvudflödet (`$willysCookie = $env:WILLYS_COOKIE`), alla `& $python`, `& $PdfToText`
+- Problem: pip, Playwrights installationsprogram, Chromium och pdftotext (som tolkar
+  opålitliga PDF:er) startas med cookies i sin miljö.
+- Åtgärd: läs värdena, ta bort variablerna ur processmiljön under körningen och återställ
+  dem i `finally` (samma mönster som `PLAYWRIGHT_BROWSERS_PATH`).
+
+### S-03 AppDir skapas med standardrättigheter; profilen är i praktiken okrypterad
+- Status: föreslagen | Område: säkerhet | Underlag: kod (rättigheter), antagande (Playwrights standardflaggor)
+- Var: `Initialize-Kvittowebblasare` (`CreateDirectory($script:AppDir)`)
+- Problem: mappen får umask-rättigheter (normalt 755). Playwright startar Chromium med
+  mock-nyckelring, så profilens cookies skyddas inte av macOS nyckelring.
+- Åtgärd: `[System.IO.Directory]::CreateDirectory($script:AppDir, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')`
+  och `[System.IO.File]::SetUnixFileMode` på befintlig mapp vid varje körning. Nämn i .NOTES
+  att profilen följer med i Time Machine.
+
+### L-01 Playwright är olåst, och en andra webbläsare uppgraderar bort den första
+- Status: föreslagen | Område: leveranskedja | Underlag: kod
+- Var: `Initialize-Kvittowebblasare` (`pip install ... --upgrade playwright`, markörfil per webbläsare)
+- Problem: versionen bestäms av installationsdagen. Installeras webkit senare uppgraderas
+  paketet, Chromium-bygget matchar inte längre, men `.installerad-chromium` säger att allt
+  är klart. Omvänt uppdateras webbläsaren aldrig, fast den används för BankID-inloggning.
+- Åtgärd: konstant `$script:PlaywrightVersion`, `pip install "playwright==$v"`, skriv
+  versionen i markörfilen och installera om när den skiljer sig. Hashlåsning: se F-03.
+
+### K-01 Lidl-datum kan hamna på fel dag och månad
+- Status: föreslagen | Område: korrekthet | Underlag: kod (inkonsekvensen), antagande (Lidls format)
+- Var: `ConvertFrom-LidlKvitto` (`$dt.ToString('yyyy-MM-dd')`) jämfört med `Save-LidlKvitto` (`.ToLocalTime()`)
+- Problem: `ConvertFrom-Json` ger `DateTime` med `Kind=Utc` för strängar som slutar på `Z`.
+  Normaliseringen formaterar då UTC-tid, medan filnamnet bygger på lokal tid. Ett köp
+  00:30 den första hamnar i föregående månad, och alla tider blir 1-2 timmar fel.
+- Åtgärd: konvertera alltid till svensk tid före formatering, i både nedladdning och
+  normalisering: `[System.TimeZoneInfo]::ConvertTime($dto, [System.TimeZoneInfo]::FindSystemTimeZoneById('Europe/Stockholm'))`.
+  Det löser också D-05 (filnamn beror på datorns tidszon).
+
+### K-02 Beloppsregexen saknar vänstergräns och förstår bara ASCII-minus framför talet
+- Status: föreslagen | Område: korrekthet | Underlag: kod (testat i Python `re`)
+- Var: `$script:AmountPos`, `$script:Amount`
+- Testresultat:
+  - `123456,78` ger `23456,78` (första siffran tappas)
+  - `Kapslar 100 129,00` ger `100 129,00` (100 129 kr i stället för 129)
+  - `PRODUKT  12 199,00` ger namn `PRODUKT`, total `12 199,00`
+  - `12,90-` och `−12,90` (U+2212) ger `12,90` utan tecken
+- Åtgärd: lägg `(?<![\d,.])` först i `AmountPos`; tillåt `[-−]` som prefix och normalisera
+  U+2212 i `ConvertFrom-SvensktTal`. Avslutande minus behövs inte för Willys/Lidl i dag
+  men troligen för ICA (antagande), så gör det samtidigt som N-03.
+  Sammanslagningen `100 129,00` går inte att lösa i regexen så länge Willys skriver
+  `1 118,34`; kontrollsumman fångar den (se D-04 om att göra kontrollsumman synlig).
+
+### D-04 Formatändring hos en kedja skriver över bra data med tomma kvitton
+- Status: föreslagen | Område: dataintegritet/korrekthet | Underlag: kod
+- Var: `ConvertFrom-LidlKvitto` (`$reLine`), `ConvertFrom-WillysKvitto` (avdelare `^-+$`), kontrollsumman i huvudflödet
+- Problem: Lidl-regexen kräver `id` före `class` och exakt klassnamn. Ändras markupen får
+  varje kvitto noll varor, det blir en DIFF-varning per kvitto, och sedan skrivs alla
+  månadsfiler över ändå. Kontrollsummans resultat sparas inte, så `kvitton.json` visar inte
+  vilka kvitton som är opålitliga.
+- Åtgärd: lägg `check_diff` (tal, 0 = stämmer) på varje kvitto i `kvitton.json`. Behandla
+  kvitto med total men noll varor som tolkningsfel, så att D-01:s månadsspärr gäller.
+- Flagga: nytt fält i det normaliserade schemat.
+
+### D-05 Dubbletter mellan körningar
+- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Var: filnamnsbygget i båda `Save-*`, steg 2 saknar dubblettkontroll
+- Problem: namnet beror på datorns tidszon (`ToLocalTime`), butikens namn och hur beloppet
+  formateras. Ändras något av dem hämtas samma kvitto igen under nytt namn och räknas dubbelt.
+- Åtgärd: K-01 tar tidszonen. Lägg dubblettvarning i steg 2 på (kedja, datum, tid, total)
+  och ta med bara det första. Radera aldrig råfilen.
+
+### K-03 `$t.storeName` i felhanteringen kastar under StrictMode
+- Status: föreslagen | Område: korrekthet | Underlag: kod
+- Var: `Save-WillysKvitto`, sista `catch` (`Write-Warning "Willys $date $($t.storeName): ..."`)
+- Problem: saknas egenskapen kastar StrictMode inne i `catch`, och hela scriptet avbryts.
+- Åtgärd: `$(Get-PropertyValue $t 'storeName')`, som Lidl-funktionen redan gör.
+
+### K-04 Nätverksfel i listfasen avbryter hela scriptet före normaliseringen
+- Status: föreslagen | Område: korrekthet | Underlag: kod
+- Var: `Invoke-KvittoRequest` (fångar bara `HttpResponseException`), huvudflödet (fångar bara `UnauthorizedAccessException`)
+- Problem: timeout eller DNS-fel försöks inte om och fångas inte, så steg 1b och 2 körs
+  aldrig. `Retry-After` används utan tak; servern kan beordra en mycket lång väntan.
+- Åtgärd: försök om även `HttpRequestException`/`TaskCanceledException`, sätt tak på
+  väntan (t.ex. 60 s), och fånga övriga fel per kedja i huvudflödet med varning.
+
+### K-05 Lidl-listan avbryts efter sida 1 om `totalCount` saknas
+- Status: föreslagen | Område: korrekthet | Underlag: kod (att fältet kan försvinna: antagande)
+- Var: `Save-LidlKvitto` (`if ($allOlder -or $seen -ge $total) { break }`)
+- Problem: saknat fält blir 0, och `$seen -ge 0` är alltid sant.
+- Åtgärd: `($total -gt 0 -and $seen -ge $total)`.
+
+### K-06 Bara den ena miljövariabeln satt: den andra kedjan hoppas över tyst
+- Status: föreslagen | Område: korrekthet | Underlag: kod
+- Var: huvudflödet (`if (IsNullOrWhiteSpace($willysCookie) -and IsNullOrWhiteSpace($lidlCookie))`)
+- Åtgärd: fråga per kedja som saknar värde. Görs enklast i kedjetabellen (N-01).
+
+### D-06 Lidls "råkvitto" är omserialiserat
+- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Var: `Save-LidlKvitto` (`ConvertTo-Json -InputObject $detail -Depth 20`)
+- Problem: svaret tolkas och skrivs ut igen. Datumsträngar blir `DateTime` och skrivs i
+  annat format, och djup över 20 kapas. Filen är inte det kedjan skickade.
+- Åtgärd: hämta med `Invoke-WebRequest`, spara `.Content` oförändrat, tolka en kopia för
+  kontrollen. Gäller bara nya nedladdningar.
+- Flagga: samma data som i dag, men byte-exakt. Befintliga filer rörs inte.
+
+## Prioritet 3: låg
+
+### U-02 Beloppet i filnamnet saneras inte
+- Status: föreslagen | Område: opålitlig data | Underlag: kod
+- Var: båda `Save-*` (`"$(...)" -replace '[,\s]', '_'`); frågeparametrarna `storeId`, `source`, `memberCardNumber` i Willys-URI:n
+- Problem: butiksnamnet går genom `Get-SafeName`, men beloppet gör det inte. Kommer det som
+  sträng med `/` kan sökvägen lämna mappen (kräver i praktiken att en mellanmapp finns).
+  Negativa belopp (`-45.5kr`) matchar inte filnamnsregexen i `ConvertFrom-WillysKvitto`.
+- Åtgärd: `-replace '[^\d.-]', '_'` på beloppet, `[Uri]::EscapeDataString` på
+  frågeparametrarna, `-?` i filnamnsregexen.
+
+### U-03 Formelinjektion i varor.csv
+- Status: föreslagen | Underlag: kod
+- Var: `Export-KvittoMapp`
+- Problem: varunamn som börjar med `=`, `+`, `-` eller `@` tolkas som formel i Excel.
+- Åtgärd: prefixa sådana namn med `'` i CSV-raden (inte i JSON).
+
+### S-04 Verbose kan visa medlemsnummer och kvittoreferens
+- Status: föreslagen | Underlag: antagande (beror på vad `Invoke-WebRequest -Verbose` skriver i 7.4)
+- Var: `Invoke-KvittoRequest` ärver `$VerbosePreference`
+- Åtgärd: kör en gång med `-Verbose` mot en lokal URL och se om URI:n skrivs. I så fall
+  `-Verbose:$false` på webbanropen.
+
+### S-05 Cookie-strängar lever kvar i `$auto` och sessionsobjekten
+- Status: föreslagen | Underlag: kod
+- Problem: `$willysCookie = $null` släpper en referens av flera. Strängar är oföränderliga
+  i .NET, så minnet går ändå inte att tömma. Kommentaren "Släpp cookies ur minnet" lovar mer
+  än koden håller.
+- Åtgärd: nolla även `$auto`, justera kommentaren. Ingen funktionell ändring.
+
+### L-02 Hjälparen körs från skrivbar mapp med mappen först i sys.path
+- Status: föreslagen | Underlag: kod
+- Var: `Invoke-Kvittohjalpare`
+- Åtgärd: starta med `& $python -I $helper ...` (isolerat läge: ingen `PYTHON*`-miljö,
+  scriptmappen läggs inte i sökvägen). Ta bort raden som raderar `kvittocookie.py` när den
+  gjort sitt. Alternativet utan fil på disk står i F-02.
+
+### L-03 python3 och pdftotext via PATH
+- Status: föreslagen | Underlag: kod
+- Åtgärd: prova kända absoluta sökvägar först (`/usr/bin/python3`, `/opt/homebrew/bin/...`),
+  PATH som reserv, och skriv vald sökväg med `Write-Verbose` även för python.
+
+### D-07 Icke-atomära skrivningar i DestinationPath
+- Status: föreslagen | Underlag: kod
+- Problem: avbrott mitt i en skrivning ger en trasig fil och `manad.*` som inte matchar
+  månadsmapparna. Nästa körning lagar det.
+- Åtgärd: skriv till temporär fil i samma mapp och `File.Move(..., $true)`.
+
+### D-08 -WhatIf: inga bestående skrivningar (ingen åtgärd krävs)
+- Status: föreslagen (notering) | Underlag: kod
+- Genomgånget: alla skrivningar till RawPath, DestinationPath och AppDir ligger bakom
+  `ShouldProcess`. Två saker att känna till: utan `-SkipDownload` görs listanropen mot
+  kedjorna ändå, och `ConvertFrom-WillysKvitto` skapar och raderar temporära filer.
+- Åtgärd: nämn listanropen i hjälptexten för `-WhatIf`.
+
+### K-07 Falska DIFF-varningar vid öresavrundning
+- Status: föreslagen | Underlag: antagande
+- Problem: kontantköp avrundas till hel krona; då skiljer totalen upp till 0,50 från radsumman.
+- Åtgärd: kontrollera mot ett kontantkvitto innan något ändras.
+
+### K-08 Rabattrader som kan tappas i Willys-tolkningen
+- Status: föreslagen | Underlag: kod (vägarna finns), antagande (om kvitton ser ut så)
+- Var: `ConvertFrom-WillysKvitto`
+- Problem: oindragen rad som börjar med `Rabatt`/`Willys Plus`/`Prisned` hoppas över helt,
+  och rabatt efter en viktvara utan viktrad läggs på en platshållare som sedan kastas.
+- Åtgärd: lägg sådana rader som egen post med negativt belopp i stället för `continue`.
+
+## Effektivitet och förkortning (E)
+
+### E-01 Alla original kopieras om vid varje körning
+- Status: föreslagen | Underlag: kod
+- Var: `Export-KvittoMapp` (`File.Copy(..., $true)`)
+- Åtgärd: hoppa över kopiering när målet finns med samma längd och ändringstid. Minskar
+  också synkning mot iCloud/Paperless.
+
+### E-02 Dubbelarbete kring Lidl-filerna
+- Status: föreslagen | Underlag: kod
+- Problem: `$lidlRawDir` och `$lidlDir` är samma sökväg, fillistan med samma filter byggs
+  i `ConvertTo-LidlPdf` och i steg 2, och hela PDF:en läses för fyra byte (löses av D-02).
+- Åtgärd: en variabel, en hjälpfunktion `Get-LidlRawFile`.
+
+### E-03 Upprepningar som kan tas bort
+- Status: föreslagen | Underlag: kod
+- `-InformationAction Continue` på ca 15 ställen: sätt `$InformationPreference = 'Continue'` överst.
+- `Get-SafeName`: `åäöÅÄÖ` är redan med i `\w`.
+- Blocken för daterade och odaterade kvitton i steg 2 gör samma sak: en lokal funktion.
+- `Write-CsvFile -Header` används bara för tom fil; behåll, men ta rubrikerna från första raden när rader finns (görs redan) och dokumentera det.
+- Kör PSScriptAnalyzer efter varje ändring; den är inte körd i granskningen.
+
+## Nya kedjor: Hemköp och ICA (N)
+
+Görs efter prioritet 1, eftersom fler kedjor mångdubblar effekten av D-01 till D-03.
+
+### N-01 Kedjetabell i stället för hårdkodade Willys/Lidl-grenar
+- Status: föreslagen | Underlag: kod
+- Problem i dagens kod som stoppar nya kedjor:
+  - `Export-KvittoMapp`: `($r.chain -eq 'Willys') ? 'willys' : 'lidl'` skickar varje ny kedja till `lidl/`.
+  - Huvudflödet har en kopierad gren per kedja; `-Chain`, miljövariabler och Python-`SITES` listar kedjorna var för sig.
+- Åtgärd: `$script:Kedjor`, en post per kedja med nyckel (ASCII: `willys`, `lidl`, `hemkop`, `ica`),
+  visningsnamn (`Hemköp`), värdnamn, miljövariabel, råmapp, nedladdningsfunktion och
+  tolkningsfunktion. Huvudflödet loopar över tabellen (Lidl först). Löser K-06.
+
+### N-02 Hemköp via samma Axfood-kod som Willys
+- Status: föreslagen | Underlag: antagande (Hemköp och Willys ägs av Axfood; att API:t är identiskt är inte bekräftat)
+- Bekräfta först (användaren, i webbläsarens nätverksflik på https://www.hemkop.se/mina-sidor/kop):
+  finns `…/axfood/rest/v1/account/pagedOrderBonusCombined` och `…/digitalreceipt/…`, och
+  heter listan `loyaltyTransactionsInPage`?
+- Åtgärd om ja:
+  - `Save-WillysKvitto` blir `Save-AxfoodKvitto -Kedja <post ur tabellen>`; värdnamn och Referer ur tabellen.
+  - `ConvertFrom-WillysKvitto` blir `ConvertFrom-AxfoodKvitto`; orden `Willys Plus`, `Med Willys`
+    och sparat-raden blir kedjespecifika mönster i tabellen. Jämför mot en riktig Hemköp-PDF innan mönstren skrivs.
+  - Python `SITES["hemkop"]` med start-URL `https://www.hemkop.se/mina-sidor/kop`.
+  - `-Chain` får `Hemkop`; miljövariabel `HEMKOP_COOKIE`; råmapp `RawPath/hemkop`.
+- Flagga: ny råmapp och ny miljövariabel för cookie. Inget nytt slags data på disk.
+
+### N-03 ICA: API:t måste kartläggas innan design
+- Status: föreslagen (blockerad på underlag) | Underlag: antagande
+- Läge: inget offentligt dokumenterat API för köphistoriken hittades. Det som finns är
+  inofficiella projekt som slutade fungera när ICA ändrade sitt API i april 2024.
+- Behövs från användaren (från https://www.ica.se/mitt-konto/kophistorik/, nätverksfliken):
+  ett listanrop och ett kvittoanrop med URL, metod, **namnen** på request-headers (inga
+  värden) och svarets struktur med personuppgifter borttagna.
+- Det avgör tre saker:
+  1. Räcker cookies, eller krävs en bearer-token i `Authorization`? I så fall måste
+     Python-hjälparen fånga den ur webbläsarens anrop. **Flagga:** ännu en token på stdout
+     och i minnet (inte på disk).
+  2. Kommer kvittot som JSON med rader (enkel tolkning, ingen pdftotext) eller som PDF?
+  3. Hur länge lever sessionen, dvs. var i ordningen ICA ska hämtas.
+- Förberedelse som kan göras nu: K-02 (avslutande minus), N-01.
+
+## Separata förslag (F)
+
+Större ändringar. Tas inte som fynd; kräver eget beslut.
+
+### F-01 Fast svensk tidszon överallt
+- Status: föreslagen. För: tar K-01 och halva D-05. Mot: befintliga filnamn kan skilja om
+  de skapats i annan tidszon (då uppstår en engångsdubblett som D-05 varnar för).
+
+### F-02 Python-hjälparen: egen fil i repot eller `python -I -c`
+- Status: föreslagen.
+- Egen `.py` bredvid scriptet. För: går att linta, testa och granska i diff. Mot: två filer att distribuera.
+- `-c $script:HelperPy`. För: ingen fil skrivs till AppDir. Mot: sämre felspårning, fortfarande inbäddad.
+
+### F-03 Hashlåst installation
+- Status: föreslagen. `requirements.txt` med `--require-hashes` för playwright och dess beroenden.
+  För: skydd mot utbytt paket. Mot: filen måste genereras om vid varje versionsbyte och
+  hashar är plattformsberoende.
+
+### F-04 Inkrementell normalisering
+- Status: föreslagen. Tolka bara månader med nya eller ändrade råfiler; `-Force` för allt.
+  För: snabbare, färre skrivningar. Mot: en fix i tolkningen slår inte igenom på gamla
+  månader utan `-Force`.
+
+### F-05 Pester-tester med fixtures
+- Status: föreslagen. För: skyddar belopps- och kvittotolkningen vid N-02/N-03.
+  Mot/**Flagga:** fixtures är kvittodata på disk i repot; de måste anonymiseras för hand.
+
+### F-06 Dela upp scriptet i modul + tunt startscript
+- Status: föreslagen. För: testbart, kedjorna i egna filer. Mot: ett script blir flera;
+  görs lämpligast först efter N-01.
