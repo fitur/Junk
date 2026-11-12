@@ -49,8 +49,12 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.1.0
+    Version:   1.2.0
     Changelog:
+        1.2.0 - K-01: alla datum/tider i svensk tid (Europe/Stockholm). K-02: vänstergräns i beloppsregexen och
+                U+2212 som minus. K-03: StrictMode-säker felhantering i Willys. K-04: omförsök vid nätverksfel,
+                tak 60 s på väntan, fel per kedja stoppar inte normaliseringen. K-05: Lidl-paginering utan
+                totalCount. K-06: frågar per kedja som saknar cookie.
         1.1.0 - D-02: nedladdning via .part + Move, ingen halv fil under slutnamnet.
                 D-03: samma datum/butik/belopp får suffix _2, _3 (filnamnsschemat utökas bakåtkompatibelt).
                 S-01: cookiens värde skrivs inte ut i varning.
@@ -115,8 +119,14 @@ $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
 # Beloppsmönster: antingen grupperat (1 118,34 / 1.001,38) eller ogrupperat upp till
 # 5 siffror (1118,34 - Willys skriver totaler så). Inga blanksteg inne i ogrupperade
 # tal, så artikelnummer (0493686  19,90) kan inte klistras ihop med ett pris.
-$script:AmountPos = '(?:\d{1,3}(?:[ .  ]\d{3})+|\d{1,5}),\d{2}'
-$script:Amount    = '-?' + $script:AmountPos
+# Vänstergräns: talet får inte börja mitt i ett längre tal (123456,78 ska inte ge 23456,78).
+$script:AmountPos = '(?<![\d,.])(?:\d{1,3}(?:[ .\u00A0\u202F]\d{3})+|\d{1,5}),\d{2}'
+# Minustecken framför talet: ASCII-minus eller U+2212
+$script:Minus     = '[-\u2212]'
+$script:Amount    = $script:Minus + '?' + $script:AmountPos
+
+# Alla datum och tider hanteras i svensk tid, oavsett datorns tidszon (filnamn och normalisering ska matcha)
+$script:SvenskTid = [System.TimeZoneInfo]::FindSystemTimeZoneById('Europe/Stockholm')
 
 $script:Manader = @('', 'Januari', 'Februari', 'Mars', 'April', 'Maj', 'Juni',
     'Juli', 'Augusti', 'September', 'Oktober', 'November', 'December')
@@ -313,7 +323,7 @@ function ConvertFrom-SvensktTal {
 
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     # \s i .NET täcker även nbsp (U+00A0) och smalt mellanslag (U+202F)
-    $s = $Text -replace '\s', ''
+    $s = ($Text -replace '\u2212', '-') -replace '\s', ''
     if ($s -eq '-') { return $null }
     if ($s.Contains(',')) { $s = $s.Replace('.', '').Replace(',', '.') }
     $value = 0.0
@@ -342,6 +352,15 @@ function Format-Tal {
 
     if ($null -eq $Value) { return '' }
     return ([double]$Value).ToString('0.###', $script:Inv).Replace('.', ',')
+}
+
+function ConvertTo-SvenskTid {
+    # Tidpunkt -> väggklocktid i Europa/Stockholm
+    [CmdletBinding()]
+    [OutputType([datetime])]
+    param([Parameter(Mandatory)][DateTimeOffset]$Value)
+
+    return [System.TimeZoneInfo]::ConvertTime($Value, $script:SvenskTid).DateTime
 }
 
 function Get-SafeName {
@@ -420,7 +439,19 @@ function Invoke-KvittoRequest {
                     if ($null -ne $retryAfter.Delta) { $delay = $retryAfter.Delta.TotalSeconds }
                     elseif ($null -ne $retryAfter.Date) { $delay = [math]::Max(1, ($retryAfter.Date - [DateTimeOffset]::UtcNow).TotalSeconds) }
                 }
+                $delay = [math]::Min(60, $delay)   # tak: servern kan beordra en orimligt lång väntan
                 Write-Verbose "HTTP $status - försök $attempt av $MaxRetries, väntar $delay s"
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            throw
+        }
+        catch [System.Net.Http.HttpRequestException], [System.Threading.Tasks.TaskCanceledException] {
+            # Nätverksfel utan HTTP-svar (DNS, anslutning, timeout): försök om med back-off.
+            # HttpResponseException ärver från HttpRequestException men fångas av blocket ovan.
+            if ($attempt -le $MaxRetries) {
+                $delay = [math]::Min(60, [math]::Pow(2, $attempt))
+                Write-Verbose "Nätverksfel - försök $attempt av $MaxRetries, väntar $delay s"
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -643,7 +674,7 @@ function Save-WillysKvitto {
         Write-Progress -Activity 'Willys' -Status "Kvitto $i av $($withReceipt.Count)" -PercentComplete ($i * 100 / $withReceipt.Count)
 
         # Filnamnsschemat är detsamma som tidigare nedladdningar, så befintliga filer känns igen
-        $date     = [DateTimeOffset]::FromUnixTimeMilliseconds([long](Get-PropertyValue $t 'bookingDate')).ToLocalTime().ToString('yyyy-MM-dd', $script:Inv)
+        $date     = (ConvertTo-SvenskTid ([DateTimeOffset]::FromUnixTimeMilliseconds([long](Get-PropertyValue $t 'bookingDate')))).ToString('yyyy-MM-dd', $script:Inv)
         $store    = Get-SafeName (Get-PropertyValue $t 'storeName')
         $amount   = "$(Get-PropertyValue $t 'amount')" -replace '[,\s]', '_'
         $baseName = "${date}_${store}_${amount}kr"
@@ -680,7 +711,7 @@ function Save-WillysKvitto {
         }
         catch {
             $result.Misslyckade++
-            Write-Warning "Willys $date $($t.storeName): $($PSItem.Exception.Message)"
+            Write-Warning "Willys $date $(Get-PropertyValue $t 'storeName'): $($PSItem.Exception.Message)"
         }
         Start-Sleep -Milliseconds 300
     }
@@ -737,12 +768,12 @@ function Save-LidlKvitto {
 
         $allOlder = $true
         foreach ($tk in $items) {
-            $day = ([DateTimeOffset](Get-PropertyValue $tk 'date')).ToLocalTime().Date
+            $day = (ConvertTo-SvenskTid ([DateTimeOffset](Get-PropertyValue $tk 'date'))).Date
             if ($day -ge $From.Date) { $allOlder = $false }
             if ($day -ge $From.Date -and $day -le $To.Date) { $inRange.Add($tk) }
         }
         Write-Verbose "Lidl sida $page : $($items.Count) kvitton ($seen av $total)"
-        if ($allOlder -or $seen -ge $total) { break }
+        if ($allOlder -or ($total -gt 0 -and $seen -ge $total)) { break }
     }
 
     # Sorterad så att suffixen (_2, _3) tilldelas lika vid varje körning, oavsett API:ts ordning
@@ -760,7 +791,7 @@ function Save-LidlKvitto {
         Write-Progress -Activity 'Lidl' -Status "Kvitto $i av $($inRange.Count)" -PercentComplete ($i * 100 / $inRange.Count)
 
         # Filnamnsschemat är detsamma som tidigare nedladdningar, så befintliga filer känns igen
-        $date     = ([DateTimeOffset](Get-PropertyValue $tk 'date')).ToLocalTime().ToString('yyyy-MM-dd', $script:Inv)
+        $date     = (ConvertTo-SvenskTid ([DateTimeOffset](Get-PropertyValue $tk 'date'))).ToString('yyyy-MM-dd', $script:Inv)
         $store    = Get-SafeName (Get-PropertyValue $tk 'store')
         $amount   = "$(Get-PropertyValue $tk 'totalAmount')" -replace '[,\s]', '_'
         $baseName = "${date}_${store}_${amount}kr"
@@ -877,7 +908,7 @@ function ConvertFrom-WillysKvitto {
     #   indrag + negativt belopp = rabatt (Rabatt, Willys Plus, Prisnedsättning, Nytt pris ...)
     #   indrag + "+"             = pant
     $reArt      = [regex]::new('^ ?(?<name>\S.*?)\s{2,}(?:(?<qty>\d+)\s*st?\s*\*\s*(?<unit>[\d,]+)\s+)?(?<total>' + $A + ')\s*$')
-    $reDisc     = [regex]::new('^\s+\S.*?\s(?<amt>-' + $AP + ')\s*$')
+    $reDisc     = [regex]::new('^\s+\S.*?\s(?<amt>' + $script:Minus + $AP + ')\s*$')
     $reDeposit  = [regex]::new('^\s+\+.*?(?<amt>' + $A + ')\s*$')
     $reWeight   = [regex]::new('^\s+(?<kg>[\d,]+)kg\s*\*\s*(?<unit>[\d,]+)kr/kg\s+(?<total>' + $A + ')')
     $reNameOnly = [regex]::new('^ ?(?<name>\p{Lu}.*?)\s*$')
@@ -1032,7 +1063,11 @@ function ConvertFrom-LidlKvitto {
                 $dt = $parsed
             }
         }
-        if ($dt) { $date = $dt.ToString('yyyy-MM-dd', $script:Inv); $time = $dt.ToString('HH:mm', $script:Inv) }
+        if ($dt) {
+            # Utc/Local -> svensk tid. Unspecified = saknar tidszon i källan, antas redan vara svensk tid.
+            if ($dt.Kind -ne [System.DateTimeKind]::Unspecified) { $dt = ConvertTo-SvenskTid ([DateTimeOffset]$dt) }
+            $date = $dt.ToString('yyyy-MM-dd', $script:Inv); $time = $dt.ToString('HH:mm', $script:Inv)
+        }
     }
 
     $raw   = [string](Get-PropertyValue $ticket 'htmlPrintedReceipt')
@@ -1189,10 +1224,18 @@ if (-not $SkipDownload) {
     else {
         $willysCookie = $env:WILLYS_COOKIE
         $lidlCookie   = $env:LIDL_COOKIE
-        if ([string]::IsNullOrWhiteSpace($willysCookie) -and [string]::IsNullOrWhiteSpace($lidlCookie)) {
+        # Fråga per kedja som saknar värde (utan inmatning, t.ex. schemalagt, varnar vi i stället)
+        $saknas = @(
+            if ('Willys' -in $Chain -and [string]::IsNullOrWhiteSpace($willysCookie)) { 'Willys' }
+            if ('Lidl' -in $Chain -and [string]::IsNullOrWhiteSpace($lidlCookie)) { 'Lidl' }
+        )
+        if ($saknas.Count -gt 0 -and [Console]::IsInputRedirected) {
+            Write-Warning "Cookie saknas för $($saknas -join ' och ') (WILLYS_COOKIE / LIDL_COOKIE) - kedjan hoppas över."
+        }
+        elseif ($saknas.Count -gt 0) {
             Write-Information 'Klistra in Cookie-raden från webbläsarens nätverksflik. Tomt = hoppa över kedjan.' -InformationAction Continue
-            if ('Willys' -in $Chain) { $willysCookie = Read-Host -Prompt 'Willys-cookie (från willys.se/mina-kop)' -MaskInput }
-            if ('Lidl' -in $Chain)   { $lidlCookie   = Read-Host -Prompt 'Lidl-cookie (från ett mre/api-anrop, hämta precis innan)' -MaskInput }
+            if ('Willys' -in $saknas) { $willysCookie = Read-Host -Prompt 'Willys-cookie (från willys.se/mina-kop)' -MaskInput }
+            if ('Lidl' -in $saknas)   { $lidlCookie   = Read-Host -Prompt 'Lidl-cookie (från ett mre/api-anrop, hämta precis innan)' -MaskInput }
         }
     }
     if ('Willys' -notin $Chain) { $willysCookie = $null }
@@ -1209,6 +1252,9 @@ if (-not $SkipDownload) {
         catch [System.UnauthorizedAccessException] {
             Write-Warning "Lidl avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
         }
+        catch {
+            Write-Warning "Lidl avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
+        }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($willysCookie)) {
@@ -1218,6 +1264,9 @@ if (-not $SkipDownload) {
         }
         catch [System.UnauthorizedAccessException] {
             Write-Warning "Willys avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
+        }
+        catch {
+            Write-Warning "Willys avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
         }
     }
 
