@@ -52,8 +52,10 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.5.0
+    Version:   1.6.0
     Changelog:
+        1.6.0 - D-06: Lidls råkvitto (JSON) sparas byte-exakt som kedjan skickade det, i stället för
+                omserialiserat. Gäller bara nya nedladdningar; befintliga filer rörs inte.
         1.5.0 - U-02: belopp i filnamn saneras, frågeparametrar kodas, negativa belopp tillåts i filnamnsregexen.
                 U-03: formelskydd i varor.csv. S-05: $auto nollas, ärligare kommentar. L-02: Python-hjälparen
                 körs med -I. L-03: kända absoluta sökvägar före PATH för python3 och pdftotext. D-07: atomära
@@ -847,26 +849,32 @@ function Save-LidlKvitto {
         if (Test-Path -LiteralPath $jsonFile) { $result.Fanns++; continue }
 
         try {
-            $id     = [Uri]::EscapeDataString([string](Get-PropertyValue $tk 'id'))
-            $detail = Invoke-KvittoRequest -Uri "https://www.lidl.se/mre/api/v1/tickets/${id}?country=SE&languageCode=sv-SE" -Headers $headers -Session $session
+            $id = [Uri]::EscapeDataString([string](Get-PropertyValue $tk 'id'))
+            # D-06: råkvittot är exakt det kedjan skickade. Svaret sparas oförändrat (byte för byte) till
+            # .part; en parsad kopia används bara för kontrollen och för HTML-utdraget.
+            Invoke-KvittoRequest -Uri "https://www.lidl.se/mre/api/v1/tickets/${id}?country=SE&languageCode=sv-SE" `
+                -Headers $headers -Session $session -OutFile "$jsonFile.part"
+            # Ogiltig JSON (t.ex. en inloggningssida) ger $null, och Assert-JsonSvar räknar det som utgången session
+            $detail = try { Get-Content -LiteralPath "$jsonFile.part" -Raw -Encoding utf8 | ConvertFrom-Json } catch { $null }
             Assert-JsonSvar -Response $detail -ExpectedProperty 'ticket' -Chain 'Lidl'
             # HTML först (bara om den inte finns), sedan JSON sist: JSON-filen är markören för "klart".
-            # Båda skrivs till .part och byts namn utan överskrivning, så ett avbrott lämnar ingen halv slutfil.
+            # Båda byter namn från .part utan överskrivning, så ett avbrott lämnar ingen halv slutfil.
             $html = Get-PropertyValue (Get-PropertyValue $detail 'ticket') 'htmlPrintedReceipt'
             if ($html -and -not (Test-Path -LiteralPath $htmlFile)) {
                 [System.IO.File]::WriteAllText("$htmlFile.part", [string]$html, $script:Utf8NoBom)
                 [System.IO.File]::Move("$htmlFile.part", $htmlFile)
             }
-            [System.IO.File]::WriteAllText("$jsonFile.part", (ConvertTo-Json -InputObject $detail -Depth 20), $script:Utf8NoBom)
             [System.IO.File]::Move("$jsonFile.part", $jsonFile)
             $result.Nya++
             Write-Verbose "Lidl: $baseName"
         }
         catch [System.UnauthorizedAccessException] {
+            [System.IO.File]::Delete("$jsonFile.part")   # tillfällig fil, aldrig ett färdigt råkvitto
             Write-Progress -Activity 'Lidl' -Completed
             throw
         }
         catch {
+            [System.IO.File]::Delete("$jsonFile.part")
             $result.Misslyckade++
             Write-Warning "Lidl $date $(Get-PropertyValue $tk 'store'): $($PSItem.Exception.Message)"
         }
