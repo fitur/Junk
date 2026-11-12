@@ -334,7 +334,7 @@
 ## Prioritet 3: låg
 
 ### U-02 Beloppet i filnamnet saneras inte
-- Status: föreslagen | Område: opålitlig data | Underlag: kod
+- Status: genomförd i 1.5.0 (testad lokalt) | Område: opålitlig data | Underlag: kod
 - Var: båda `Save-*` (`"$(...)" -replace '[,\s]', '_'`); frågeparametrarna `storeId`, `source`, `memberCardNumber` i Willys-URI:n
 - Problem: butiksnamnet går genom `Get-SafeName`, men beloppet gör det inte. Kommer det som
   sträng med `/` kan sökvägen lämna mappen (kräver i praktiken att en mellanmapp finns).
@@ -343,43 +343,43 @@
   frågeparametrarna, `-?` i filnamnsregexen.
 
 ### U-03 Formelinjektion i varor.csv
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.5.0 (testad lokalt) | Underlag: kod
 - Var: `Export-KvittoMapp`
 - Problem: varunamn som börjar med `=`, `+`, `-` eller `@` tolkas som formel i Excel.
 - Åtgärd: prefixa sådana namn med `'` i CSV-raden (inte i JSON).
 
 ### S-04 Verbose kan visa medlemsnummer och kvittoreferens
-- Status: föreslagen att avskrivas | Underlag: motbevisat i pwsh 7.4.6
+- Status: avskriven (ingen åtgärd; motbevisad i pwsh 7.4.6, se nedan) | Underlag: motbevisat i pwsh 7.4.6
 - Testkört mot lokal server: `Invoke-WebRequest`/`Invoke-RestMethod -Verbose` skriver
   `Requested HTTP/1.1 GET with 0-byte payload` utan URI. Ingen åtgärd behövs.
 
 ### S-05 Cookie-strängar lever kvar i `$auto` och sessionsobjekten
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.5.0 (testad lokalt) | Underlag: kod
 - Problem: `$willysCookie = $null` släpper en referens av flera. Strängar är oföränderliga
   i .NET, så minnet går ändå inte att tömma. Kommentaren "Släpp cookies ur minnet" lovar mer
   än koden håller.
 - Åtgärd: nolla även `$auto`, justera kommentaren. Ingen funktionell ändring.
 
 ### L-02 Hjälparen körs från skrivbar mapp med mappen först i sys.path
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.5.0 (testad lokalt) | Underlag: kod
 - Var: `Invoke-Kvittohjalpare`
 - Åtgärd: starta med `& $python -I $helper ...` (isolerat läge: ingen `PYTHON*`-miljö,
   scriptmappen läggs inte i sökvägen). Ta bort raden som raderar `kvittocookie.py` när den
   gjort sitt. Alternativet utan fil på disk står i F-02.
 
 ### L-03 python3 och pdftotext via PATH
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.5.0 (testad lokalt) | Underlag: kod
 - Åtgärd: prova kända absoluta sökvägar först (`/usr/bin/python3`, `/opt/homebrew/bin/...`),
   PATH som reserv, och skriv vald sökväg med `Write-Verbose` även för python.
 
 ### D-07 Icke-atomära skrivningar i DestinationPath
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.5.0 (testad lokalt) | Underlag: kod
 - Problem: avbrott mitt i en skrivning ger en trasig fil och `manad.*` som inte matchar
   månadsmapparna. Nästa körning lagar det.
 - Åtgärd: skriv till temporär fil i samma mapp och `File.Move(..., $true)`.
 
 ### D-08 -WhatIf: inga bestående skrivningar (ingen åtgärd krävs)
-- Status: föreslagen (notering) | Underlag: kod
+- Status: genomförd i 1.5.0 (hjälptexten nämner listanropen och temporära filer) | Underlag: kod
 - Genomgånget: alla skrivningar till RawPath, DestinationPath och AppDir ligger bakom
   `ShouldProcess`. Två saker att känna till: utan `-SkipDownload` görs listanropen mot
   kedjorna ändå, och `ConvertFrom-WillysKvitto` skapar och raderar temporära filer.
