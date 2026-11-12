@@ -24,7 +24,7 @@
 ## Akut: regression efter 1.3.0
 
 ### L-04 Låst Playwright-version går inte att installera på Python 3.9
-- Status: föreslagen | Område: leveranskedja | Allvarlighet: hög (blockerar `-AutoCookie` och Lidl-PDF) | Underlag: användarens felutskrift + PyPI-metadata
+- Status: genomförd i 1.4.1 (versionskontrollen testad lokalt; installation på Python 3.9 ej testad, ingen 3.9 här) | Område: leveranskedja | Allvarlighet: hög (blockerar `-AutoCookie` och Lidl-PDF) | Underlag: användarens felutskrift + PyPI-metadata
 - Var: `$script:PlaywrightVersion = '1.65.1'` (rad 156), `Initialize-Kvittowebblasare` (rad 525-544)
 - Symptom: `No matching distribution found for playwright==1.65.1`; pip listar versioner till och med 1.60.0.
 - Orsak: Playwright 1.61.0 och senare kräver Python 3.10 (`requires_python >=3.10`), 1.60.0

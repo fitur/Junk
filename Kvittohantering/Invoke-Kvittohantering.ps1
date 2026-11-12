@@ -49,8 +49,10 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.4.0
+    Version:   1.4.1
     Changelog:
+        1.4.1 - L-04: Playwright låst till 1.60.0 (sista versionen för Python 3.9), kontroll av venv-tolkens
+                version före pip. 1.3.0 låste till 1.65.1, som kräver Python 3.10 och inte gick att installera.
         1.4.0 - D-04: check_diff per kvitto i kvitton.json (nytt fält); kvitto med total men noll varor
                 räknas som tolkningsfel och spärrar månaden. D-05: dubblettkontroll på kedja, datum, tid
                 och total i normaliseringen.
@@ -153,7 +155,9 @@ $script:AppDir = Join-Path -Path $HOME -ChildPath 'Library/Application Support/K
 
 # Låst Playwright-version: paketet och webbläsarbygget hör ihop. Höj här medvetet; markörfilen
 # innehåller versionen, så en ändring ger en ominstallation vid nästa körning.
-$script:PlaywrightVersion = '1.65.1'
+# 1.60.0 är sista versionen som stöder Python 3.9 (Xcodes python3). 1.61+ kräver Python 3.10.
+$script:PlaywrightVersion   = '1.60.0'
+$script:PlaywrightMinPython = [version]'3.9'
 
 # AppDir innehåller webbläsarprofilen (cookies, i praktiken okrypterade): bara ägaren (700)
 $script:AppDirMode = [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute'
@@ -538,6 +542,11 @@ function Initialize-Kvittowebblasare {
         Write-Information 'Skapar Python-miljö...' -InformationAction Continue
         & $sysPython.Source -m venv (Join-Path $script:AppDir 'venv') | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "python3 -m venv misslyckades (kod $LASTEXITCODE)" }
+    }
+    # pip listar bara versioner som passar tolken, så felet blir annars obegripligt
+    $pyVersion = [version](& $python -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+    if ($pyVersion -lt $script:PlaywrightMinPython) {
+        throw "Playwright $($script:PlaywrightVersion) kräver Python $($script:PlaywrightMinPython)+, men venv har $pyVersion."
     }
     Write-Information 'Installerar Playwright...' -InformationAction Continue
     & $python -m pip install --quiet --disable-pip-version-check "playwright==$($script:PlaywrightVersion)" | Out-Host
