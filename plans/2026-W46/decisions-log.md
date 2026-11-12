@@ -432,7 +432,7 @@
 Görs efter prioritet 1, eftersom fler kedjor mångdubblar effekten av D-01 till D-03.
 
 ### N-01 Kedjetabell i stället för hårdkodade Willys/Lidl-grenar
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.7.0 för Willys och Lidl (tabell $script:Kedjor; utdata och logg identiska med 1.6.1 på samma fixturer; K-06 löst via tabellen). Hemköp och ICA läggs till i N-02/N-03 | Underlag: kod
 - Problem i dagens kod som stoppar nya kedjor:
   - `Export-KvittoMapp`: `($r.chain -eq 'Willys') ? 'willys' : 'lidl'` skickar varje ny kedja till `lidl/`.
   - Huvudflödet har en kopierad gren per kedja; `-Chain`, miljövariabler och Python-`SITES` listar kedjorna var för sig.

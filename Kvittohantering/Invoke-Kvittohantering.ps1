@@ -52,8 +52,11 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.6.1
+    Version:   1.7.0
     Changelog:
+        1.7.0 - N-01: kedjetabell ($script:Kedjor) i stället för hårdkodade Willys/Lidl-grenar i huvudflödet,
+                Export-KvittoMapp, cookiehantering och miljövariabler. K-06 löses av tabellen. Ingen ändring
+                av beteende för Willys och Lidl.
         1.6.1 - E-01: originalkopior hoppas över när målet har samma längd och ändringstid. E-02: Get-LidlRawFile.
                 E-03: $InformationPreference, Export-KvittoGrupp, förenklad Get-SafeName. E-04: BOM i filen och
                 OutputType på ConvertTo-Array (PSScriptAnalyzer utan anmärkningar). Ingen funktionell ändring
@@ -154,6 +157,48 @@ $script:Amount    = $script:Minus + '?' + $script:AmountPos
 
 # Alla datum och tider hanteras i svensk tid, oavsett datorns tidszon (filnamn och normalisering ska matcha)
 $script:SvenskTid = [System.TimeZoneInfo]::FindSystemTimeZoneById('Europe/Stockholm')
+
+# N-01: en post per kedja. Huvudflödet, Export-KvittoMapp och cookiehanteringen loopar över tabellen
+# i stället för hårdkodade grenar. Ordningen här är ordningen för cookiefrågor, -AutoCookie och
+# normalisering. Nyckeln (ASCII) används som mappnamn och i Python-hjälparens SITES, som måste ha
+# samma nycklar. -Chain (ValidateSet i param-blocket) måste uppdateras samtidigt som tabellen.
+#   Namn            visningsnamn; ligger i kvittots chain-fält och i -Chain
+#   EnvVar          miljövariabel med cookie-raden
+#   Prompt          text vid dold inmatning
+#   RawDir          undermapp i RawPath
+#   Filter          filmönster för råkvittona
+#   Extra           filändelser bredvid råkvittot som också kopieras till månadsmappen
+#   KortlivadToken  hämtas först (Lidls token lever bara ca 30 minuter)
+#   Hamta / Tolka   funktionsnamn för nedladdning respektive tolkning
+#   KraverPdfToText tolkningen behöver pdftotext (och normaliseringen avbryts om det saknas)
+$script:Kedjor = [ordered]@{
+    willys = [pscustomobject]@{
+        Nyckel          = 'willys'
+        Namn            = 'Willys'
+        EnvVar          = 'WILLYS_COOKIE'
+        Prompt          = 'Willys-cookie (från willys.se/mina-kop)'
+        RawDir          = 'willys'
+        Filter          = '*.pdf'
+        Extra           = @()
+        KortlivadToken  = $false
+        Hamta           = 'Save-WillysKvitto'
+        Tolka           = 'ConvertFrom-WillysKvitto'
+        KraverPdfToText = $true
+    }
+    lidl   = [pscustomobject]@{
+        Nyckel          = 'lidl'
+        Namn            = 'Lidl'
+        EnvVar          = 'LIDL_COOKIE'
+        Prompt          = 'Lidl-cookie (från ett mre/api-anrop, hämta precis innan)'
+        RawDir          = 'lidl'
+        Filter          = '*.json'
+        Extra           = @('.html', '.pdf')
+        KortlivadToken  = $true
+        Hamta           = 'Save-LidlKvitto'
+        Tolka           = 'ConvertFrom-LidlKvitto'
+        KraverPdfToText = $false
+    }
+}
 
 $script:Manader = @('', 'Januari', 'Februari', 'Mars', 'April', 'Maj', 'Juni',
     'Juli', 'Augusti', 'September', 'Oktober', 'November', 'December')
@@ -621,20 +666,23 @@ function Get-KvittoCookieAutomatisk {
     )
 
     # Willys först (BankID tar längst), sedan Lidl så att Lidl-tokenen är så färsk som möjligt
-    $order = @('willys', 'lidl') | Where-Object { $_ -in $Chain }
+    $order = @($script:Kedjor.Values | Where-Object { $_.Namn -in $Chain } | ForEach-Object { $_.Nyckel })
     Write-Information 'Öppnar webbläsarfönster - logga in om du blir ombedd.'
     $helperArgs = @('cookies', '--profile', (Join-Path $script:AppDir 'profil'), '--browser', $Browser, '--chains') + $order
     return Invoke-Kvittohjalpare -Browser $Browser -Arguments $helperArgs
 }
 
-function Get-LidlRawFile {
-    # E-02: Lidls råkvitton (JSON) i en mapp, sorterade på namn. Tom lista om mappen saknas.
+function Get-KedjaRawFile {
+    # E-02/N-01: en kedjas råkvitton i en mapp, sorterade på namn. Tom lista om mappen saknas.
     [CmdletBinding()]
     [OutputType([System.IO.FileInfo])]
-    param([Parameter(Mandatory)][string]$LidlDir)
+    param(
+        [Parameter(Mandatory)][string]$Dir,
+        [Parameter(Mandatory)][string]$Filter
+    )
 
-    if (-not (Test-Path -LiteralPath $LidlDir -PathType Container)) { return }
-    Get-ChildItem -LiteralPath $LidlDir -Filter '*.json' -File |
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return }
+    Get-ChildItem -LiteralPath $Dir -Filter $Filter -File |
         Where-Object { $_.Name -ne 'kvittolista.json' } |
         Sort-Object -Property Name
 }
@@ -646,7 +694,7 @@ function ConvertTo-LidlPdf {
     [OutputType([int])]
     param([Parameter(Mandatory)][string]$LidlDir)
 
-    $pending = @(Get-LidlRawFile -LidlDir $LidlDir |
+    $pending = @(Get-KedjaRawFile -Dir $LidlDir -Filter $script:Kedjor.lidl.Filter |
             Where-Object { -not (Test-Path -LiteralPath ([System.IO.Path]::ChangeExtension($_.FullName, '.pdf'))) })
     if ($pending.Count -eq 0) { return 0 }
     if (-not $PSCmdlet.ShouldProcess($LidlDir, "Skapa $($pending.Count) PDF:er av Lidl-kvitton")) { return 0 }
@@ -1305,20 +1353,18 @@ function Export-KvittoMapp {
     Write-CsvFile -Path (Join-Path $Folder 'varor.csv') -Rows @($rows) `
         -Header 'kedja', 'datum', 'butik', 'vara', 'antal', 'apris', 'radsumma', 'rabatt', 'kvitto_total'
 
-    # Originalkvitton: Willys-PDF, Lidl-JSON + läsbar HTML
+    # Originalkvitton (Willys-PDF, Lidl-JSON) och kedjans extrafiler (Lidl: läsbar HTML + PDF för Paperless)
     foreach ($r in $Receipts) {
-        $sub = ($r.chain -eq 'Willys') ? 'willys' : 'lidl'
-        $src = Join-Path (Join-Path $Source $sub) $r.source_file
+        $kedja = $script:Kedjor.Values | Where-Object { $_.Namn -eq $r.chain } | Select-Object -First 1
+        if (-not $kedja) { throw "Okänd kedja '$($r.chain)' i kvittot $($r.source_file) - saknas i kedjetabellen." }
+        $src = Join-Path (Join-Path $Source $kedja.RawDir) $r.source_file
         if (Test-Path -LiteralPath $src -PathType Leaf) {
             Copy-FilAtomiskt -Source $src -Destination (Join-Path $Folder $r.source_file)
         }
-        if ($r.chain -eq 'Lidl') {
-            # Läsbar HTML + PDF (för Paperless) om de finns
-            foreach ($ext in '.html', '.pdf') {
-                $extra = [System.IO.Path]::ChangeExtension($src, $ext)
-                if (Test-Path -LiteralPath $extra -PathType Leaf) {
-                    Copy-FilAtomiskt -Source $extra -Destination (Join-Path $Folder (Split-Path $extra -Leaf))
-                }
+        foreach ($ext in $kedja.Extra) {
+            $extra = [System.IO.Path]::ChangeExtension($src, $ext)
+            if (Test-Path -LiteralPath $extra -PathType Leaf) {
+                Copy-FilAtomiskt -Source $extra -Destination (Join-Path $Folder (Split-Path $extra -Leaf))
             }
         }
     }
@@ -1354,7 +1400,7 @@ if ($FromDate -gt $ToDate) { throw "FromDate ($($FromDate.ToString('yyyy-MM-dd')
 # S-02: cookies i miljövariabler hämtas till variabler och tas bort ur processmiljön, så att
 # barnprocesser (pip, Playwright, Chromium, pdftotext) inte ärver dem. Återställs i finally.
 $envCookies = @{}
-foreach ($envName in 'WILLYS_COOKIE', 'LIDL_COOKIE') {
+foreach ($envName in @($script:Kedjor.Values | ForEach-Object { $_.EnvVar })) {
     $envCookies[$envName] = [System.Environment]::GetEnvironmentVariable($envName)
     [System.Environment]::SetEnvironmentVariable($envName, $null)
 }
@@ -1366,70 +1412,55 @@ try {
     if (-not $SkipDownload) {
         # Cookies hålls bara i minnet. Källa i prioritetsordning:
         # -AutoCookie (webbläsarfönster) > miljövariabler > dold inmatning
-        $willysCookie = $null
-        $lidlCookie   = $null
-        $auto         = $null
+        $cookies = @{}
+        foreach ($k in $script:Kedjor.Values) { $cookies[$k.Nyckel] = $null }
+        $auto = $null
         if ($AutoCookie) {
             if ($PSCmdlet.ShouldProcess('webbläsarfönster', "Hämta inloggning för $($Chain -join ' och ')")) {
                 $auto = Get-KvittoCookieAutomatisk -Chain $Chain -Browser $Browser
-                $willysCookie = Get-PropertyValue $auto 'willys'
-                $lidlCookie   = Get-PropertyValue $auto 'lidl'
+                foreach ($k in $script:Kedjor.Values) { $cookies[$k.Nyckel] = Get-PropertyValue $auto $k.Nyckel }
             }
         }
         else {
-            $willysCookie = $envCookies['WILLYS_COOKIE']
-            $lidlCookie   = $envCookies['LIDL_COOKIE']
+            foreach ($k in $script:Kedjor.Values) { $cookies[$k.Nyckel] = $envCookies[$k.EnvVar] }
             # Fråga per kedja som saknar värde (utan inmatning, t.ex. schemalagt, varnar vi i stället)
-            $saknas = @(
-                if ('Willys' -in $Chain -and [string]::IsNullOrWhiteSpace($willysCookie)) { 'Willys' }
-                if ('Lidl' -in $Chain -and [string]::IsNullOrWhiteSpace($lidlCookie)) { 'Lidl' }
-            )
+            $saknas = @($script:Kedjor.Values | Where-Object {
+                    $_.Namn -in $Chain -and [string]::IsNullOrWhiteSpace($cookies[$_.Nyckel]) })
             if ($saknas.Count -gt 0 -and [Console]::IsInputRedirected) {
-                Write-Warning "Cookie saknas för $($saknas -join ' och ') (WILLYS_COOKIE / LIDL_COOKIE) - kedjan hoppas över."
+                Write-Warning "Cookie saknas för $(($saknas.Namn) -join ' och ') ($(($saknas.EnvVar) -join ' / ')) - kedjan hoppas över."
             }
             elseif ($saknas.Count -gt 0) {
                 Write-Information 'Klistra in Cookie-raden från webbläsarens nätverksflik. Tomt = hoppa över kedjan.'
-                if ('Willys' -in $saknas) { $willysCookie = Read-Host -Prompt 'Willys-cookie (från willys.se/mina-kop)' -MaskInput }
-                if ('Lidl' -in $saknas)   { $lidlCookie   = Read-Host -Prompt 'Lidl-cookie (från ett mre/api-anrop, hämta precis innan)' -MaskInput }
+                foreach ($k in $saknas) { $cookies[$k.Nyckel] = Read-Host -Prompt $k.Prompt -MaskInput }
             }
         }
-        if ('Willys' -notin $Chain) { $willysCookie = $null }
-        if ('Lidl' -notin $Chain)   { $lidlCookie   = $null }
+        foreach ($k in $script:Kedjor.Values) {
+            if ($k.Namn -notin $Chain) { $cookies[$k.Nyckel] = $null }
+        }
 
         $downloads = [System.Collections.Generic.List[object]]::new()
 
-        # Lidl först - dess token lever bara ca 30 minuter
-        if (-not [string]::IsNullOrWhiteSpace($lidlCookie)) {
-            Write-Information 'Hämtar Lidl-kvitton...'
+        # Kedjor med kortlivad token (Lidl) först, sedan resten i tabellens ordning
+        $hamtOrdning = @($script:Kedjor.Values | Where-Object { $_.KortlivadToken }) +
+        @($script:Kedjor.Values | Where-Object { -not $_.KortlivadToken })
+        foreach ($k in $hamtOrdning) {
+            if ([string]::IsNullOrWhiteSpace($cookies[$k.Nyckel])) { continue }
+            Write-Information "Hämtar $($k.Namn)-kvitton..."
             try {
-                $downloads.Add((Save-LidlKvitto -CookieString $lidlCookie -OutputDir (Join-Path $RawPath 'lidl') -From $FromDate -To $ToDate))
+                $downloads.Add((& $k.Hamta -CookieString $cookies[$k.Nyckel] -OutputDir (Join-Path $RawPath $k.RawDir) -From $FromDate -To $ToDate))
             }
             catch [System.UnauthorizedAccessException] {
-                Write-Warning "Lidl avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
+                Write-Warning "$($k.Namn) avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
             }
             catch {
-                Write-Warning "Lidl avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
-            }
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($willysCookie)) {
-            Write-Information 'Hämtar Willys-kvitton...'
-            try {
-                $downloads.Add((Save-WillysKvitto -CookieString $willysCookie -OutputDir (Join-Path $RawPath 'willys') -From $FromDate -To $ToDate))
-            }
-            catch [System.UnauthorizedAccessException] {
-                Write-Warning "Willys avbröts: $($PSItem.Exception.Message) Redan hämtade kvitton är sparade - hämta ny cookie och kör om."
-            }
-            catch {
-                Write-Warning "Willys avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
+                Write-Warning "$($k.Namn) avbröts av ett fel: $($PSItem.Exception.Message) Normaliseringen fortsätter."
             }
         }
 
         # Släpp referenserna till cookie-strängarna. Strängar är oföränderliga i .NET, så minnet
         # går inte att tömma; det här gör bara att de kan städas bort av skräpinsamlaren.
-        $willysCookie = $null
-        $lidlCookie   = $null
-        $auto         = $null
+        $cookies = $null
+        $auto    = $null
 
         foreach ($d in $downloads) {
             Write-Information ('{0}: {1} i perioden, {2} nya, {3} fanns redan, {4} misslyckade' -f
@@ -1440,7 +1471,7 @@ try {
     # --------------------------------------------------------------------------
     # Steg 1b: PDF av Lidl-kvitton (för Paperless) - även för tidigare nedladdade
     # --------------------------------------------------------------------------
-    $lidlRawDir = Join-Path $RawPath 'lidl'
+    $lidlRawDir = Join-Path $RawPath $script:Kedjor.lidl.RawDir
     if (-not $SkipPdf -and (Test-Path -LiteralPath $lidlRawDir -PathType Container)) {
         try {
             $created = ConvertTo-LidlPdf -LidlDir $lidlRawDir
@@ -1475,38 +1506,29 @@ try {
         $failedFiles.Add($FileName)
     }
 
-    # Willys
-    $willysDir = Join-Path $RawPath 'willys'
-    $pdfFiles  = @(if (Test-Path -LiteralPath $willysDir) {
-            Get-ChildItem -LiteralPath $willysDir -Filter '*.pdf' -File | Sort-Object -Property Name
-        })
-    if ($pdfFiles.Count -gt 0) {
-        $pdfToText = Find-PdfToText -Hint $PdfToTextPath
-        if (-not $pdfToText) {
-            # Avbryt före skrivning: annars skrivs alla månadsfiler om utan Willys-kvitton
-            throw "pdftotext saknas - $($pdfFiles.Count) Willys-kvitton kan inte tolkas. Installera med: brew install poppler"
+    # Tolka kedjornas råkvitton i tabellens ordning
+    foreach ($k in $script:Kedjor.Values) {
+        $files = @(Get-KedjaRawFile -Dir (Join-Path $RawPath $k.RawDir) -Filter $k.Filter)
+        if ($files.Count -eq 0) { continue }
+
+        $tolkArgs = @{}
+        if ($k.KraverPdfToText) {
+            $pdfToText = Find-PdfToText -Hint $PdfToTextPath
+            if (-not $pdfToText) {
+                # Avbryt före skrivning: annars skrivs alla månadsfiler om utan kedjans kvitton
+                throw "pdftotext saknas - $($files.Count) $($k.Namn)-kvitton kan inte tolkas. Installera med: brew install poppler"
+            }
+            Write-Verbose "Använder pdftotext: $pdfToText"
+            $tolkArgs.PdfToText = $pdfToText
         }
-        Write-Verbose "Använder pdftotext: $pdfToText"
-        foreach ($pdf in $pdfFiles) {
+        foreach ($file in $files) {
             try {
-                $receipts.Add((ConvertFrom-WillysKvitto -File $pdf -PdfToText $pdfToText))
+                $receipts.Add((& $k.Tolka -File $file @tolkArgs))
             }
             catch {
-                Block-KvittoManad -FileName $pdf.Name
-                Write-Warning "Willys $($pdf.Name): $($PSItem.Exception.Message)"
+                Block-KvittoManad -FileName $file.Name
+                Write-Warning "$($k.Namn) $($file.Name): $($PSItem.Exception.Message)"
             }
-        }
-    }
-
-    # Lidl
-    $jsonFiles = @(Get-LidlRawFile -LidlDir $lidlRawDir)
-    foreach ($js in $jsonFiles) {
-        try {
-            $receipts.Add((ConvertFrom-LidlKvitto -File $js))
-        }
-        catch {
-            Block-KvittoManad -FileName $js.Name
-            Write-Warning "Lidl $($js.Name): $($PSItem.Exception.Message)"
         }
     }
 
