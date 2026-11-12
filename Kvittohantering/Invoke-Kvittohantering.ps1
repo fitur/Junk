@@ -26,6 +26,9 @@
 
     Returnerar ett objekt per skriven månadsmapp.
 
+    -WhatIf gör inga bestående skrivningar. Utan -SkipDownload görs ändå listanropen mot
+    kedjorna (bara läsning), och Willys-tolkningen skapar och raderar temporära filer.
+
 .EXAMPLE
     ./Invoke-Kvittohantering.ps1
     Frågar efter cookies, hämtar de senaste tre månaderna och normaliserar allt.
@@ -49,8 +52,12 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.4.1
+    Version:   1.5.0
     Changelog:
+        1.5.0 - U-02: belopp i filnamn saneras, frågeparametrar kodas, negativa belopp tillåts i filnamnsregexen.
+                U-03: formelskydd i varor.csv. S-05: $auto nollas, ärligare kommentar. L-02: Python-hjälparen
+                körs med -I. L-03: kända absoluta sökvägar före PATH för python3 och pdftotext. D-07: atomära
+                skrivningar i DestinationPath. D-08: -WhatIf dokumenterad.
         1.4.1 - L-04: Playwright låst till 1.60.0 (sista versionen för Python 3.9), kontroll av venv-tolkens
                 version före pip. 1.3.0 låste till 1.65.1, som kräver Python 3.10 och inte gick att installera.
         1.4.0 - D-04: check_diff per kvitto i kvitton.json (nytt fält); kvitto med total men noll varor
@@ -529,8 +536,9 @@ function Initialize-Kvittowebblasare {
     if ((Test-Path -LiteralPath $python) -and (Test-Path -LiteralPath $marker) -and
         ([System.IO.File]::ReadAllText($marker).Trim() -eq $script:PlaywrightVersion)) { return $python }
 
-    $sysPython = Get-Command -Name 'python3' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $sysPython = Find-Python3
     if (-not $sysPython) { throw 'python3 saknas. Installera Xcode Command Line Tools: xcode-select --install' }
+    Write-Verbose "Använder python: $sysPython"
 
     if (-not $PSCmdlet.ShouldProcess($script:AppDir, "Installera Playwright och $Browser (engångsåtgärd, ca 150-250 MB)")) {
         throw 'Installationen av webbläsaren avbröts.'
@@ -540,7 +548,7 @@ function Initialize-Kvittowebblasare {
 
     if (-not (Test-Path -LiteralPath $python)) {
         Write-Information 'Skapar Python-miljö...' -InformationAction Continue
-        & $sysPython.Source -m venv (Join-Path $script:AppDir 'venv') | Out-Host
+        & $sysPython -m venv (Join-Path $script:AppDir 'venv') | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "python3 -m venv misslyckades (kod $LASTEXITCODE)" }
     }
     # pip listar bara versioner som passar tolken, så felet blir annars obegripligt
@@ -583,9 +591,9 @@ function Invoke-Kvittohjalpare {
 
         $helper = Join-Path $script:AppDir 'kvittohjalpare.py'
         [System.IO.File]::WriteAllText($helper, $script:HelperPy, $script:Utf8NoBom)
-        [System.IO.File]::Delete((Join-Path $script:AppDir 'kvittocookie.py'))   # tidigare namn
 
-        $stdout = & $python $helper @Arguments
+        # -I = isolerat läge: ingen PYTHON*-miljö och scriptmappen läggs inte först i sys.path
+        $stdout = & $python -I $helper @Arguments
         if ($LASTEXITCODE -ne 0) { throw "Webbläsarhjälparen ($($Arguments[0])) misslyckades med kod $LASTEXITCODE." }
     }
     finally {
@@ -710,7 +718,7 @@ function Save-WillysKvitto {
         # Filnamnsschemat är detsamma som tidigare nedladdningar, så befintliga filer känns igen
         $date     = (ConvertTo-SvenskTid ([DateTimeOffset]::FromUnixTimeMilliseconds([long](Get-PropertyValue $t 'bookingDate')))).ToString('yyyy-MM-dd', $script:Inv)
         $store    = Get-SafeName (Get-PropertyValue $t 'storeName')
-        $amount   = "$(Get-PropertyValue $t 'amount')" -replace '[,\s]', '_'
+        $amount   = "$(Get-PropertyValue $t 'amount')" -replace '[^\d.-]', '_'
         $baseName = "${date}_${store}_${amount}kr"
         $nameCount[$baseName] = 1 + [int]$nameCount[$baseName]
         if ($nameCount[$baseName] -gt 1) { $baseName += "_$($nameCount[$baseName])" }
@@ -721,7 +729,9 @@ function Save-WillysKvitto {
         $source  = (Get-PropertyValue $t 'receiptSource') ?? 'aws'
         $refEnc  = [Uri]::EscapeDataString((Get-PropertyValue $t 'digitalReceiptReference'))
         $uri     = "https://www.willys.se/axfood/rest/order/orders/digitalreceipt/$refEnc" +
-                   "?date=$date&storeId=$(Get-PropertyValue $t 'storeCustomerId')&source=$source&memberCardNumber=$(Get-PropertyValue $t 'memberCardNumber')"
+                   "?date=$date&storeId=$([Uri]::EscapeDataString([string](Get-PropertyValue $t 'storeCustomerId')))" +
+                   "&source=$([Uri]::EscapeDataString([string]$source))" +
+                   "&memberCardNumber=$([Uri]::EscapeDataString([string](Get-PropertyValue $t 'memberCardNumber')))"
 
         try {
             # Ladda ner till .part och byt namn först när filen är verifierad. Ett avbrott
@@ -827,7 +837,7 @@ function Save-LidlKvitto {
         # Filnamnsschemat är detsamma som tidigare nedladdningar, så befintliga filer känns igen
         $date     = (ConvertTo-SvenskTid ([DateTimeOffset](Get-PropertyValue $tk 'date'))).ToString('yyyy-MM-dd', $script:Inv)
         $store    = Get-SafeName (Get-PropertyValue $tk 'store')
-        $amount   = "$(Get-PropertyValue $tk 'totalAmount')" -replace '[,\s]', '_'
+        $amount   = "$(Get-PropertyValue $tk 'totalAmount')" -replace '[^\d.-]', '_'
         $baseName = "${date}_${store}_${amount}kr"
         $nameCount[$baseName] = 1 + [int]$nameCount[$baseName]
         if ($nameCount[$baseName] -gt 1) { $baseName += "_$($nameCount[$baseName])" }
@@ -891,6 +901,21 @@ function New-KvittoRad {
     }
 }
 
+function Find-Python3 {
+    # L-03: kända absoluta sökvägar först, PATH som reserv (en python3 tidigt i PATH kan vara
+    # ett bakdörrsprogram i en skrivbar mapp)
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    foreach ($candidate in '/usr/bin/python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3') {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    $cmd = Get-Command -Name 'python3' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
 function Find-PdfToText {
     # VS Code startat från Dock kan sakna Homebrew i PATH, därför kontrolleras
     # även Homebrews standardsökvägar.
@@ -902,12 +927,13 @@ function Find-PdfToText {
         if (Test-Path -LiteralPath $Hint -PathType Leaf) { return $Hint }
         throw "pdftotext hittades inte på angiven sökväg: $Hint"
     }
-    $cmd = Get-Command -Name 'pdftotext' -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($cmd) { return $cmd.Source }
+    # L-03: kända absoluta sökvägar först, PATH som reserv
     foreach ($candidate in '/opt/homebrew/bin/pdftotext', '/usr/local/bin/pdftotext') {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
     }
+    $cmd = Get-Command -Name 'pdftotext' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
     return $null
 }
 
@@ -1045,7 +1071,7 @@ function ConvertFrom-WillysKvitto {
     # - butik: alltid därifrån (korrekta åäö, samma format oavsett kvittots årgång)
     # - datum/total: reserv om PDF-texten saknar dem
     $mf = [regex]::Match($File.Name.Normalize([System.Text.NormalizationForm]::FormC),
-        '^(?<d>\d{4}-\d{2}-\d{2})_(?<s>.+)_(?<a>\d+(?:\.\d+)?)kr(?:_\d+)?\.pdf$')
+        '^(?<d>\d{4}-\d{2}-\d{2})_(?<s>.+)_(?<a>-?\d+(?:\.\d+)?)kr(?:_\d+)?\.pdf$')
     if ($mf.Success) {
         $store = $mf.Groups['s'].Value.Replace('_', ' ')
         if (-not $date) { $date = $mf.Groups['d'].Value }
@@ -1161,6 +1187,43 @@ function ConvertFrom-LidlKvitto {
 # ==========================================================================
 # Normalisering - skrivning (.NET, så att ShouldProcess bara frågar en gång per mapp)
 # ==========================================================================
+function Protect-CsvFormel {
+    # U-03: text som börjar med = + - @ (eller tab/radbrytning) tolkas som formel i Excel.
+    # Prefixa med ' i CSV-raden; JSON-filerna rörs inte.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+
+    if ($Text -match '^[=+\-@\t\r]') { return "'" + $Text }
+    return $Text
+}
+
+function Write-FilAtomiskt {
+    # D-07: skriv till temporär fil i samma mapp och byt namn över målet, så att ett avbrott
+    # aldrig lämnar en trasig fil.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][System.Text.Encoding]$Encoding
+    )
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $Text, $Encoding)
+    [System.IO.File]::Move($tmp, $Path, $true)
+}
+
+function Copy-FilAtomiskt {
+    # D-07: samma sak för kopior av originalkvitton i DestinationPath
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    $tmp = "$Destination.tmp"
+    [System.IO.File]::Copy($Source, $tmp, $true)
+    [System.IO.File]::Move($tmp, $Destination, $true)
+}
+
 function Write-CsvFile {
     # Semikolonseparerad CSV med UTF-8 BOM (krävs för åäö i Excel för Mac)
     [CmdletBinding()]
@@ -1175,7 +1238,7 @@ function Write-CsvFile {
     else {
         @($Header -join ';')
     }
-    [System.IO.File]::WriteAllText($Path, (($lines -join "`r`n") + "`r`n"), $script:Utf8Bom)
+    Write-FilAtomiskt -Path $Path -Text (($lines -join "`r`n") + "`r`n") -Encoding $script:Utf8Bom
 }
 
 function Export-KvittoMapp {
@@ -1190,7 +1253,7 @@ function Export-KvittoMapp {
     [void][System.IO.Directory]::CreateDirectory($Folder)
 
     $json = ConvertTo-Json -InputObject @($Receipts) -Depth 20
-    [System.IO.File]::WriteAllText((Join-Path $Folder 'kvitton.json'), $json, $script:Utf8NoBom)
+    Write-FilAtomiskt -Path (Join-Path $Folder 'kvitton.json') -Text $json -Encoding $script:Utf8NoBom
 
     $rows = foreach ($r in $Receipts) {
         foreach ($it in $r.items) {
@@ -1198,7 +1261,7 @@ function Export-KvittoMapp {
                 kedja        = $r.chain
                 datum        = $r.date
                 butik        = $r.store
-                vara         = $it.name
+                vara         = Protect-CsvFormel $it.name
                 antal        = Format-Tal $it.quantity
                 apris        = Format-Krona $it.unit_price
                 radsumma     = Format-Krona $it.line_total
@@ -1215,14 +1278,14 @@ function Export-KvittoMapp {
         $sub = ($r.chain -eq 'Willys') ? 'willys' : 'lidl'
         $src = Join-Path (Join-Path $Source $sub) $r.source_file
         if (Test-Path -LiteralPath $src -PathType Leaf) {
-            [System.IO.File]::Copy($src, (Join-Path $Folder $r.source_file), $true)
+            Copy-FilAtomiskt -Source $src -Destination (Join-Path $Folder $r.source_file)
         }
         if ($r.chain -eq 'Lidl') {
             # Läsbar HTML + PDF (för Paperless) om de finns
             foreach ($ext in '.html', '.pdf') {
                 $extra = [System.IO.Path]::ChangeExtension($src, $ext)
                 if (Test-Path -LiteralPath $extra -PathType Leaf) {
-                    [System.IO.File]::Copy($extra, (Join-Path $Folder (Split-Path $extra -Leaf)), $true)
+                    Copy-FilAtomiskt -Source $extra -Destination (Join-Path $Folder (Split-Path $extra -Leaf))
                 }
             }
         }
@@ -1257,6 +1320,7 @@ try {
         # -AutoCookie (webbläsarfönster) > miljövariabler > dold inmatning
         $willysCookie = $null
         $lidlCookie   = $null
+        $auto         = $null
         if ($AutoCookie) {
             if ($PSCmdlet.ShouldProcess('webbläsarfönster', "Hämta inloggning för $($Chain -join ' och ')")) {
                 $auto = Get-KvittoCookieAutomatisk -Chain $Chain -Browser $Browser
@@ -1313,9 +1377,11 @@ try {
             }
         }
 
-        # Släpp cookies ur minnet så snart de inte behövs
+        # Släpp referenserna till cookie-strängarna. Strängar är oföränderliga i .NET, så minnet
+        # går inte att tömma; det här gör bara att de kan städas bort av skräpinsamlaren.
         $willysCookie = $null
         $lidlCookie   = $null
+        $auto         = $null
 
         foreach ($d in $downloads) {
             Write-Information ('{0}: {1} i perioden, {2} nya, {3} fanns redan, {4} misslyckade' -f
@@ -1510,8 +1576,8 @@ try {
     }
     elseif ($PSCmdlet.ShouldProcess($DestinationPath, 'Skriv månadsöversikt (manad.json + manad.csv)')) {
         [void][System.IO.Directory]::CreateDirectory($DestinationPath)
-        [System.IO.File]::WriteAllText((Join-Path $DestinationPath 'manad.json'),
-            (ConvertTo-Json -InputObject $overview -Depth 20), $script:Utf8NoBom)
+        Write-FilAtomiskt -Path (Join-Path $DestinationPath 'manad.json') `
+            -Text (ConvertTo-Json -InputObject $overview -Depth 20) -Encoding $script:Utf8NoBom
 
         $csvRows = foreach ($o in $overview) {
             [pscustomobject]@{
