@@ -33,7 +33,7 @@
 ## Prioritet 1: hög
 
 ### D-01 Normaliseringen skriver över månadsfiler med ofullständigt underlag
-- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Status: genomförd i 1.0.1 (testad lokalt med -SkipDownload: saknad pdftotext lämnar DestinationPath orörd; spärrad månad och manad.* skrivs inte) | Område: dataintegritet | Underlag: kod
 - Var: huvudflödet, steg 2 (`if (-not $pdfToText) { Write-Warning ... }` och `catch`-blocken
   runt `ConvertFrom-WillysKvitto`/`ConvertFrom-LidlKvitto`)
 - Problem: alla månadsmappar skrivs om från noll vid varje körning. Saknas pdftotext hoppas
