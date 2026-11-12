@@ -49,8 +49,11 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.3.0
+    Version:   1.4.0
     Changelog:
+        1.4.0 - D-04: check_diff per kvitto i kvitton.json (nytt fält); kvitto med total men noll varor
+                räknas som tolkningsfel och spärrar månaden. D-05: dubblettkontroll på kedja, datum, tid
+                och total i normaliseringen.
         1.3.0 - S-02: cookies i miljövariabler ärvs inte av barnprocesser. S-03: AppDir med rättigheter 700.
                 L-01: Playwright låst till 1.65.1, version i markörfilen. U-01: Lidl-HTML renderas utan
                 script och nätverk.
@@ -1389,6 +1392,30 @@ try {
         }
     }
 
+    # D-04: kvitto med total men noll varor är ett tolkningsfel (t.ex. ändrad markup hos kedjan), inte ett tomt kvitto.
+    # Månaden spärras på samma sätt som vid ett undantag, så att tidigare bra filer inte skrivs över.
+    foreach ($r in $receipts) {
+        if (($r.total ?? 0) -gt 0 -and @($r.items).Count -eq 0) {
+            Block-KvittoManad -FileName $r.source_file
+            Write-Warning "$($r.chain) $($r.source_file): total $(Format-Krona $r.total) kr men inga varor - räknas som tolkningsfel (har kedjan ändrat formatet?)."
+        }
+    }
+
+    # D-05: samma kvitto under två filnamn (t.ex. ändrat butiksnamn) räknas bara en gång. Råfilen raderas aldrig.
+    $seenKeys = [System.Collections.Generic.HashSet[string]]::new()
+    $unique   = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $receipts) {
+        if ($r.date -and $r.time -and $null -ne $r.total) {
+            $key = '{0}|{1}|{2}|{3}' -f $r.chain, $r.date, $r.time, $r.total.ToString('F2', $script:Inv)
+            if (-not $seenKeys.Add($key)) {
+                Write-Warning "Dubblett hoppas över: $($r.source_file) ($($r.chain) $($r.date) $($r.time), $(Format-Krona $r.total) kr) har samma kedja, tid och total som ett tidigare kvitto. Råfilen lämnas orörd."
+                continue
+            }
+        }
+        $unique.Add($r)
+    }
+    $receipts = $unique
+
     if ($failedFiles.Count -gt 0) {
         Write-Warning ("{0} råkvitton gick inte att tolka. Berörda månader ({1}) skrivs inte och manad.json/manad.csv uppdateras inte. Filer: {2}" -f
             $failedFiles.Count, (($blockedMonths | Sort-Object) -join ', '), ($failedFiles -join ', '))
@@ -1405,6 +1432,8 @@ try {
         $radsum = 0.0
         foreach ($it in $r.items) { $radsum += ($it.line_total ?? 0) + ($it.discount ?? 0) }
         $diff = [math]::Round($radsum - ($r.total ?? 0), 2)
+        # D-04: resultatet sparas per kvitto (0 = stämmer), så att kvitton.json visar vilka som är opålitliga
+        Add-Member -InputObject $r -NotePropertyName 'check_diff' -NotePropertyValue $diff -Force
         if ([math]::Abs($diff) -ge 0.01) {
             Write-Warning ('DIFF {0} kr: {1} {2} {3} ({4}) - kontrollera mot originalet' -f
                 (Format-Krona $diff), $r.date, $r.chain, $r.store, $r.source_file)

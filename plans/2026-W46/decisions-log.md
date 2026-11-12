@@ -161,7 +161,7 @@
 ## Prioritet 2: medel
 
 ### U-01 Lidl-HTML renderas med script och nätverk påslaget
-- Status: föreslagen | Område: opålitlig data | Underlag: kod
+- Status: genomförd i 1.3.0 (testad lokalt) | Område: opålitlig data | Underlag: kod
 - Var: Python `render_receipt` / `cmd_pdf` (`page.set_content(doc, wait_until="load")`)
 - Problem: innehållet i `<pre>` klistras in oescapat. `<script>`, `<img src=...>`, `<link>`
   och `<meta refresh>` i kvittotexten körs respektive hämtas. Sidan har ingen åtkomst till
@@ -183,7 +183,7 @@
   blir PDF:en avkortad (antagande, kontrollera mot ett sparat kvitto).
 
 ### S-02 Cookies i miljövariabler ärvs av alla barnprocesser
-- Status: föreslagen | Område: säkerhet | Underlag: kod
+- Status: genomförd i 1.3.0 (testad lokalt) | Område: säkerhet | Underlag: kod
 - Var: huvudflödet (`$willysCookie = $env:WILLYS_COOKIE`), alla `& $python`, `& $PdfToText`
 - Problem: pip, Playwrights installationsprogram, Chromium och pdftotext (som tolkar
   opålitliga PDF:er) startas med cookies i sin miljö.
@@ -191,7 +191,7 @@
   dem i `finally` (samma mönster som `PLAYWRIGHT_BROWSERS_PATH`).
 
 ### S-03 AppDir skapas med standardrättigheter; profilen är i praktiken okrypterad
-- Status: föreslagen | Område: säkerhet | Underlag: kod (rättigheter), antagande (Playwrights standardflaggor)
+- Status: genomförd i 1.3.0 (testad lokalt) | Område: säkerhet | Underlag: kod (rättigheter), antagande (Playwrights standardflaggor)
 - Var: `Initialize-Kvittowebblasare` (`CreateDirectory($script:AppDir)`)
 - Problem: mappen får umask-rättigheter (normalt 755). Playwright startar Chromium med
   mock-nyckelring, så profilens cookies skyddas inte av macOS nyckelring.
@@ -200,7 +200,7 @@
   att profilen följer med i Time Machine.
 
 ### L-01 Playwright är olåst, och en andra webbläsare uppgraderar bort den första
-- Status: föreslagen | Område: leveranskedja | Underlag: kod
+- Status: genomförd i 1.3.0 (testad lokalt) | Område: leveranskedja | Underlag: kod
 - Var: `Initialize-Kvittowebblasare` (`pip install ... --upgrade playwright`, markörfil per webbläsare)
 - Problem: versionen bestäms av installationsdagen. Installeras webkit senare uppgraderas
   paketet, Chromium-bygget matchar inte längre, men `.installerad-chromium` säger att allt
@@ -209,7 +209,7 @@
   versionen i markörfilen och installera om när den skiljer sig. Hashlåsning: se F-03.
 
 ### K-01 Lidl-datum kan hamna på fel dag och månad
-- Status: föreslagen | Område: korrekthet | Underlag: kod, bekräftat i pwsh (beteendet); antagande (vilket format Lidl skickar) | Rad: 1003
+- Status: genomförd i 1.2.0 (testad lokalt) | Område: korrekthet | Underlag: kod, bekräftat i pwsh (beteendet); antagande (vilket format Lidl skickar) | Rad: 1003
 - Var: `ConvertFrom-LidlKvitto` (`$dt.ToString('yyyy-MM-dd')`) jämfört med `Save-LidlKvitto` (`.ToLocalTime()`)
 - Problem: `ConvertFrom-Json` ger `DateTime` med `Kind=Utc` för strängar som slutar på `Z`.
   Normaliseringen formaterar då UTC-tid, medan filnamnet bygger på lokal tid. Ett köp
@@ -223,7 +223,7 @@
   - Utan tidszon blir det `Kind=Unspecified` och lämnas orört.
 
 ### K-02 Beloppsregexen saknar vänstergräns och förstår bara ASCII-minus framför talet
-- Status: föreslagen | Område: korrekthet | Underlag: kod, bekräftat i pwsh (.NET-regex) | Rad: 109-110
+- Status: genomförd i 1.2.0 (testad lokalt) | Område: korrekthet | Underlag: kod, bekräftat i pwsh (.NET-regex) | Rad: 109-110
 - Var: `$script:AmountPos`, `$script:Amount`
 - Testresultat:
   - `123456,78` ger `23456,78` (första siffran tappas)
@@ -240,7 +240,7 @@
   är oförändrat. `[double]::TryParse` klarar inte U+2212, så tecknet måste bytas före tolkning.
 
 ### D-04 Formatändring hos en kedja skriver över bra data med tomma kvitton
-- Status: föreslagen | Område: dataintegritet/korrekthet | Underlag: kod
+- Status: genomförd i 1.4.0 (testad lokalt) | Område: dataintegritet/korrekthet | Underlag: kod
 - Var: `ConvertFrom-LidlKvitto` (`$reLine`), `ConvertFrom-WillysKvitto` (avdelare `^-+$`), kontrollsumman i huvudflödet
 - Problem: Lidl-regexen kräver `id` före `class` och exakt klassnamn. Ändras markupen får
   varje kvitto noll varor, det blir en DIFF-varning per kvitto, och sedan skrivs alla
@@ -251,7 +251,7 @@
 - Flagga: nytt fält i det normaliserade schemat.
 
 ### D-05 Dubbletter mellan körningar
-- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Status: genomförd i 1.4.0 (testad lokalt) | Område: dataintegritet | Underlag: kod
 - Var: filnamnsbygget i båda `Save-*`, steg 2 saknar dubblettkontroll
 - Problem: namnet beror på datorns tidszon (`ToLocalTime`), butikens namn och hur beloppet
   formateras. Ändras något av dem hämtas samma kvitto igen under nytt namn och räknas dubbelt.
@@ -259,14 +259,14 @@
   och ta med bara det första. Radera aldrig råfilen.
 
 ### K-03 `$t.storeName` i felhanteringen kastar under StrictMode
-- Status: föreslagen | Område: korrekthet | Underlag: kod
+- Status: genomförd i 1.2.0 (testad lokalt) | Område: korrekthet | Underlag: kod
 - Var: `Save-WillysKvitto`, sista `catch` (`Write-Warning "Willys $date $($t.storeName): ..."`)
 - Problem: saknas egenskapen kastar StrictMode inne i `catch`, och hela scriptet avbryts.
 - Åtgärd: `$(Get-PropertyValue $t 'storeName')`, som Lidl-funktionen redan gör.
 - Rad: 663. Testkört: `"$($t.storeName)"` på ett objekt utan egenskapen kastar under `Set-StrictMode -Version Latest`.
 
 ### K-04 Nätverksfel i listfasen avbryter hela scriptet före normaliseringen
-- Status: föreslagen | Område: korrekthet | Underlag: kod
+- Status: genomförd i 1.2.0 (testad lokalt) | Område: korrekthet | Underlag: kod
 - Var: `Invoke-KvittoRequest` (fångar bara `HttpResponseException`), huvudflödet (fångar bara `UnauthorizedAccessException`)
 - Problem: timeout eller DNS-fel försöks inte om och fångas inte, så steg 1b och 2 körs
   aldrig. `Retry-After` används utan tak; servern kan beordra en mycket lång väntan.
@@ -274,14 +274,14 @@
   väntan (t.ex. 60 s), och fånga övriga fel per kedja i huvudflödet med varning.
 
 ### K-05 Lidl-listan avbryts efter sida 1 om `totalCount` saknas
-- Status: föreslagen | Område: korrekthet | Underlag: kod (att fältet kan försvinna: antagande)
+- Status: genomförd i 1.2.0 (testad lokalt) | Område: korrekthet | Underlag: kod (att fältet kan försvinna: antagande)
 - Var: `Save-LidlKvitto` (`if ($allOlder -or $seen -ge $total) { break }`)
 - Problem: saknat fält blir 0, och `$seen -ge 0` är alltid sant.
 - Åtgärd: `($total -gt 0 -and $seen -ge $total)`.
 - Rad: 725. Testkört: `[int]($null ?? 0)` ger 0 och `10 -ge 0` är sant.
 
 ### K-06 Bara den ena miljövariabeln satt: den andra kedjan hoppas över tyst
-- Status: föreslagen | Område: korrekthet | Underlag: kod
+- Status: genomförd i 1.2.0 (testad lokalt) | Område: korrekthet | Underlag: kod
 - Var: huvudflödet (`if (IsNullOrWhiteSpace($willysCookie) -and IsNullOrWhiteSpace($lidlCookie))`)
 - Åtgärd: fråga per kedja som saknar värde. Görs enklast i kedjetabellen (N-01).
 
