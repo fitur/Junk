@@ -20,7 +20,7 @@
 ## Att verifiera innan något annat (V)
 
 ### V-01 Klistringsartefakter i underlaget
-- Status: föreslagen | Allvarlighet: kritisk om de finns i filen, annars ingen
+- Status: ingen åtgärd (verifierad mot committad fil: domänerna är vanliga strängar, teckenklassen har blanksteg, punkt, U+00A0 och U+202F) | Allvarlighet: kritisk om de finns i filen, annars ingen
 - Var: `Save-WillysKvitto`/`Save-LidlKvitto` (`-Domain '[www.willys.se](https://www.willys.se)'`),
   `$script:AmountPos` (teckenklassen `[ .  ]`)
 - Problem: domänen står som markdown-länk och teckenklassen har blanksteg av okänd typ.
@@ -31,7 +31,7 @@
 ## Prioritet 1: hög
 
 ### D-01 Normaliseringen skriver över månadsfiler med ofullständigt underlag
-- Status: föreslagen | Område: dataintegritet | Underlag: kod
+- Status: genomförd i 1.0.1 (testad lokalt med -SkipDownload: saknad pdftotext lämnar DestinationPath orörd; spärrad månad och manad.* skrivs inte) | Område: dataintegritet | Underlag: kod
 - Var: huvudflödet, steg 2 (`if (-not $pdfToText) { Write-Warning ... }` och `catch`-blocken
   runt `ConvertFrom-WillysKvitto`/`ConvertFrom-LidlKvitto`)
 - Problem: alla månadsmappar skrivs om från noll vid varje körning. Saknas pdftotext hoppas

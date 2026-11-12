@@ -49,8 +49,10 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
-    Version:   1.0.0
+    Version:   1.0.1
     Changelog:
+        1.0.1 - D-01: avbryter om pdftotext saknas och spärrar skrivning av månader (samt manad.*)
+                med otolkbara råkvitton, så att tidigare bra filer inte skrivs över.
         1.0.0 - Utgångspunkt: befintligt script, ingen funktionell ändring.
 
     Kräver PowerShell 7.4+ (??, ternary, Read-Host -MaskInput, ConvertTo-Csv -UseQuotes).
@@ -1227,6 +1229,20 @@ if (-not (Test-Path -LiteralPath $RawPath -PathType Container)) {
 
 $receipts = [System.Collections.Generic.List[object]]::new()
 
+# Månader (yyyy-MM, eller 'Odaterade') där minst ett råkvitto inte gick att tolka. Allt skrivs om
+# från noll, så en månad med ofullständigt underlag får inte skrivas: en tidigare bra fil ska stå kvar.
+$blockedMonths = [System.Collections.Generic.HashSet[string]]::new()
+$failedFiles   = [System.Collections.Generic.List[string]]::new()
+
+function Block-KvittoManad {
+    # Spärrar månaden (ur filnamnets datumprefix) för skrivning och minns filen till varningen.
+    param([Parameter(Mandatory)][string]$FileName)
+
+    $month = if ($FileName -match '^(\d{4}-\d{2})') { $Matches[1] } else { 'Odaterade' }
+    [void]$blockedMonths.Add($month)
+    $failedFiles.Add($FileName)
+}
+
 # Willys
 $willysDir = Join-Path $RawPath 'willys'
 $pdfFiles  = @(if (Test-Path -LiteralPath $willysDir) {
@@ -1235,17 +1251,17 @@ $pdfFiles  = @(if (Test-Path -LiteralPath $willysDir) {
 if ($pdfFiles.Count -gt 0) {
     $pdfToText = Find-PdfToText -Hint $PdfToTextPath
     if (-not $pdfToText) {
-        Write-Warning "pdftotext saknas - $($pdfFiles.Count) Willys-kvitton hoppas över. Installera med: brew install poppler"
+        # Avbryt före skrivning: annars skrivs alla månadsfiler om utan Willys-kvitton
+        throw "pdftotext saknas - $($pdfFiles.Count) Willys-kvitton kan inte tolkas. Installera med: brew install poppler"
     }
-    else {
-        Write-Verbose "Använder pdftotext: $pdfToText"
-        foreach ($pdf in $pdfFiles) {
-            try {
-                $receipts.Add((ConvertFrom-WillysKvitto -File $pdf -PdfToText $pdfToText))
-            }
-            catch {
-                Write-Warning "Willys $($pdf.Name): $($PSItem.Exception.Message)"
-            }
+    Write-Verbose "Använder pdftotext: $pdfToText"
+    foreach ($pdf in $pdfFiles) {
+        try {
+            $receipts.Add((ConvertFrom-WillysKvitto -File $pdf -PdfToText $pdfToText))
+        }
+        catch {
+            Block-KvittoManad -FileName $pdf.Name
+            Write-Warning "Willys $($pdf.Name): $($PSItem.Exception.Message)"
         }
     }
 }
@@ -1262,8 +1278,14 @@ foreach ($js in $jsonFiles) {
         $receipts.Add((ConvertFrom-LidlKvitto -File $js))
     }
     catch {
+        Block-KvittoManad -FileName $js.Name
         Write-Warning "Lidl $($js.Name): $($PSItem.Exception.Message)"
     }
+}
+
+if ($failedFiles.Count -gt 0) {
+    Write-Warning ("{0} råkvitton gick inte att tolka. Berörda månader ({1}) skrivs inte och manad.json/manad.csv uppdateras inte. Filer: {2}" -f
+        $failedFiles.Count, (($blockedMonths | Sort-Object) -join ', '), ($failedFiles -join ', '))
 }
 
 if ($receipts.Count -eq 0) {
@@ -1293,13 +1315,21 @@ foreach ($group in ($dated | Group-Object -Property { $_.date.Substring(0, 7) } 
     $mname  = '{0:D2}-{1}' -f $mnum, $script:Manader[$mnum]
     $folder = Join-Path (Join-Path $DestinationPath $year) $mname
 
+    if ($blockedMonths.Contains($group.Name)) {
+        Write-Warning "Hoppar över ${year}/${mname}: minst ett råkvitto för månaden gick inte att tolka. Befintliga filer lämnas orörda."
+        continue
+    }
+
     if ($PSCmdlet.ShouldProcess($folder, "Skriv $($group.Count) normaliserade kvitton")) {
         Export-KvittoMapp -Folder $folder -Receipts @($group.Group) -Source $RawPath
         [pscustomobject]@{ Manad = "$year/$mname"; Kvitton = $group.Count; Mapp = $folder }
     }
 }
 
-if ($undated.Count -gt 0) {
+if ($undated.Count -gt 0 -and $blockedMonths.Contains('Odaterade')) {
+    Write-Warning "Hoppar över Odaterade: ett råkvitto utan läsbart datum i filnamnet gick inte att tolka. Befintliga filer lämnas orörda."
+}
+elseif ($undated.Count -gt 0) {
     $folder = Join-Path $DestinationPath 'Odaterade'
     Write-Warning "$($undated.Count) kvitton saknar tolkbart datum och läggs i $folder"
     if ($PSCmdlet.ShouldProcess($folder, "Skriv $($undated.Count) odaterade kvitton")) {
@@ -1330,7 +1360,11 @@ $overview = @($dated |
         } |
         Sort-Object -Property manad, kedja -Descending)
 
-if ($PSCmdlet.ShouldProcess($DestinationPath, 'Skriv månadsöversikt (manad.json + manad.csv)')) {
+if ($blockedMonths.Count -gt 0) {
+    # Översikten räknas på alla kvitton; med ofullständigt underlag skulle den bli fel
+    Write-Warning 'Hoppar över manad.json och manad.csv: underlaget är ofullständigt (se varning ovan).'
+}
+elseif ($PSCmdlet.ShouldProcess($DestinationPath, 'Skriv månadsöversikt (manad.json + manad.csv)')) {
     [void][System.IO.Directory]::CreateDirectory($DestinationPath)
     [System.IO.File]::WriteAllText((Join-Path $DestinationPath 'manad.json'),
         (ConvertTo-Json -InputObject $overview -Depth 20), $script:Utf8NoBom)
