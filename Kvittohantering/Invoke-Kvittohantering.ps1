@@ -49,6 +49,10 @@
     Visar vilka månadsmappar som skulle skrivas, utan nedladdning och utan att skriva.
 
 .NOTES
+    Version:   1.0.0
+    Changelog:
+        1.0.0 - Utgångspunkt: befintligt script, ingen funktionell ändring.
+
     Kräver PowerShell 7.4+ (??, ternary, Read-Host -MaskInput, ConvertTo-Csv -UseQuotes).
     Willys-PDF:er kräver pdftotext från poppler: brew install poppler
     Cookies innehåller inloggningstoken - de läses dolt och sparas aldrig på disk av skriptet.
