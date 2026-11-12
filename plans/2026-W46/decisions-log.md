@@ -400,19 +400,19 @@
 ## Effektivitet och förkortning (E)
 
 ### E-01 Alla original kopieras om vid varje körning
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.6.1 (testad lokalt) | Underlag: kod
 - Var: `Export-KvittoMapp` (`File.Copy(..., $true)`)
 - Åtgärd: hoppa över kopiering när målet finns med samma längd och ändringstid. Minskar
   också synkning mot iCloud/Paperless.
 
 ### E-02 Dubbelarbete kring Lidl-filerna
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.6.1 (testad lokalt) | Underlag: kod
 - Problem: `$lidlRawDir` och `$lidlDir` är samma sökväg, fillistan med samma filter byggs
   i `ConvertTo-LidlPdf` och i steg 2, och hela PDF:en läses för fyra byte (löses av D-02).
 - Åtgärd: en variabel, en hjälpfunktion `Get-LidlRawFile`.
 
 ### E-03 Upprepningar som kan tas bort
-- Status: föreslagen | Underlag: kod
+- Status: genomförd i 1.6.1 (testad lokalt) | Underlag: kod
 - `-InformationAction Continue` på ca 15 ställen: sätt `$InformationPreference = 'Continue'` överst.
 - `Get-SafeName`: `åäöÅÄÖ` är redan med i `\w`.
 - Blocken för daterade och odaterade kvitton i steg 2 gör samma sak: en lokal funktion.
@@ -420,7 +420,7 @@
 - Kör PSScriptAnalyzer efter varje ändring.
 
 ### E-04 PSScriptAnalyzer-anmärkningar i nuvarande version
-- Status: föreslagen | Underlag: kört (PSScriptAnalyzer 1.23.0, standardregler)
+- Status: genomförd i 1.6.1 (testad lokalt) (BOM vald framför undantag i settings-fil; PSScriptAnalyzer ger inga anmärkningar) | Underlag: kört (PSScriptAnalyzer 1.23.0, standardregler)
 - `PSUseBOMForUnicodeEncodedFile` (varning): filen har åäö men ingen BOM. pwsh 7 läser
   UTF-8 utan BOM, så det är ofarligt med `#Requires -Version 7.4`. Välj: lägg till BOM
   eller undanta regeln i en `PSScriptAnalyzerSettings.psd1`.
